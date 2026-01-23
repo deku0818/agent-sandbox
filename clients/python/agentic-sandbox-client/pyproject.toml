@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentic_sandbox"
-version = "0.1.0"
+version = "0.1.1"
 description = "A client library to interact with the Agentic Sandbox on Kubernetes."
 readme = "README.md"
 requires-python = ">=3.7"

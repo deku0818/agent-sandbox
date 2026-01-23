@@ -20,7 +20,6 @@ created on first use and persists until explicitly destroyed.
 """
 
 import logging
-import os
 import socket
 import subprocess
 import sys
@@ -130,7 +129,7 @@ class PersistentSandboxClient:
             content = content.encode('utf-8')
 
         self._request(base_url, session_id, "POST", "upload",
-                      files={'file': (os.path.basename(path), content)})
+                      files={'file': (path, content)})
 
     def read(self, session_id: str, path: str) -> bytes:
         """Download a file from the sandbox."""
