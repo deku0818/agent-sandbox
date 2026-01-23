@@ -216,13 +216,20 @@ class PersistentSandboxClient:
         }
 
         logging.info(f"Creating sandbox: {session_id}")
-        self.k8s_api.create_namespaced_custom_object(
-            group=CLAIM_API_GROUP,
-            version=CLAIM_API_VERSION,
-            namespace=self.namespace,
-            plural=CLAIM_PLURAL_NAME,
-            body=manifest
-        )
+        try:
+            self.k8s_api.create_namespaced_custom_object(
+                group=CLAIM_API_GROUP,
+                version=CLAIM_API_VERSION,
+                namespace=self.namespace,
+                plural=CLAIM_PLURAL_NAME,
+                body=manifest
+            )
+        except client.ApiException as e:
+            if e.status == 409:
+                # SandboxClaim already exists, continue to wait for it to be ready
+                logging.info(f"SandboxClaim already exists: {session_id}, waiting for ready")
+            else:
+                raise
 
         # Wait for ready
         w = watch.Watch()
@@ -287,7 +294,7 @@ class PersistentSandboxClient:
                     base_url = f"http://127.0.0.1:{port}"
                     self._tunnels[session_id] = (proc, base_url)
                     return base_url
-            except (socket.timeout, ConnectionRefusedError):
+            except (TimeoutError):
                 time.sleep(0.5)
 
         proc.kill()
