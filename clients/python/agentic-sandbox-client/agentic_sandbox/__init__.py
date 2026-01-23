@@ -13,3 +13,6 @@
 # limitations under the License.
 
 from .sandbox_client import SandboxClient
+from .persistent_client import PersistentSandboxClient
+
+__all__ = ["SandboxClient", "PersistentSandboxClient"]
