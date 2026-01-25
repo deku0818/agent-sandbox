@@ -19,6 +19,14 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     curl \
+    ca-certificates \
+    gnupg \
+    ripgrep \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js (LTS version) for npx support
+RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv
@@ -28,6 +36,12 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 COPY pyproject.toml main.py /opt/.runtime/
 RUN uv pip install --system --no-cache -r /opt/.runtime/pyproject.toml \
     && chmod 500 /opt/.runtime
+
+# Set Python path environment variable
+ENV PYTHONPATH=/workspace
+
+# Set pip source to Tsinghua mirror
+ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
 
 # Create user workspace
 RUN mkdir -p /workspace && chown 1000:1000 /workspace

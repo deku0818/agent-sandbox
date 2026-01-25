@@ -20,6 +20,7 @@ import asyncio
 import logging
 import os
 import pty
+import re
 import select
 import sys
 import uuid
@@ -48,23 +49,33 @@ class ExecuteResponse(BaseModel):
 class PersistentShell:
     """Maintains a persistent shell using PTY."""
 
+    # ANSI escape sequence regex for cleaning terminal output
+    _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z@-~]|\x1b\[\?[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x07|\r')
+
     def __init__(self):
         self.master_fd: int | None = None
         self.pid: int | None = None
         self._lock = asyncio.Lock()
+        self._initialized = False
 
     async def start(self) -> None:
-        if self.pid and self._is_alive():
+        if self.pid and self._is_alive() and self._initialized:
             return
 
         self.pid, self.master_fd = pty.fork()
         if self.pid == 0:
+            os.environ["TERM"] = "dumb"
             os.chdir("/workspace")
             os.execvp("/bin/bash", ["/bin/bash", "-i"])
         else:
             os.set_blocking(self.master_fd, False)
             await asyncio.sleep(0.2)
-            self._read_all()  # Clear initial output
+            self._read_all()
+            # Disable prompts
+            os.write(self.master_fd, b"export PS1='' PS2='' PS3='' PS4=''; unset PROMPT_COMMAND\n")
+            await asyncio.sleep(0.1)
+            self._read_all()
+            self._initialized = True
             logger.info(f"Shell started, PID: {self.pid}")
 
     def _is_alive(self) -> bool:
@@ -96,63 +107,94 @@ class PersistentShell:
         async with self._lock:
             await self.start()
 
-            marker = f"__DONE_{uuid.uuid4().hex[:8]}__"
+            cmd_id = uuid.uuid4().hex[:8]
+            start_marker = f"___START_{cmd_id}___"
+            end_marker_prefix = f"___END_{cmd_id}___"
+
+            # Clear buffer
             self._read_all()
 
-            # Send command with markers to detect completion
-            full_cmd = f"{command}\n_ec=$?; echo {marker}; echo __EXIT__$_ec; echo __CWD__$(pwd)\n"
-            os.write(self.master_fd, full_cmd.encode())
+            # Send command with markers (exit code embedded in end marker)
+            wrapped = (
+                f"echo '{start_marker}'\n"
+                f"{command}\n"
+                f"__ec__=$?; echo \"{end_marker_prefix}$__ec__$(pwd)___\"\n"
+            )
+            os.write(self.master_fd, wrapped.encode())
 
-            # Read output
+            # Read output until end marker
             output = []
-            start = asyncio.get_event_loop().time()
-            while asyncio.get_event_loop().time() - start < timeout:
+            start_time = asyncio.get_event_loop().time()
+            while asyncio.get_event_loop().time() - start_time < timeout:
                 await asyncio.sleep(0.05)
                 chunk = self._read_all(0.1)
                 if chunk:
                     output.append(chunk)
-                full = ''.join(output)
-                if marker in full and "__EXIT__" in full and "__CWD__" in full:
+                if end_marker_prefix in ''.join(output):
                     break
             else:
                 return ExecuteResponse(stdout=''.join(output), stderr="timeout", exit_code=-1, cwd="")
 
-            full = ''.join(output)
+            raw = ''.join(output)
+            # Clean ANSI sequences
+            cleaned = self._ANSI_RE.sub('', raw)
 
-            # Parse exit code
+            # Parse output line by line
+            lines = cleaned.split('\n')
+            stdout_parts = []
+            started = False
             exit_code = 0
-            try:
-                idx = full.find("__EXIT__") + 8
-                exit_code = int(full[idx:full.find('\n', idx)].strip())
-            except (ValueError, IndexError):
-                pass
-
-            # Parse cwd
             cwd = ""
-            try:
-                idx = full.find("__CWD__") + 7
-                cwd = full[idx:full.find('\n', idx)].strip()
-            except (ValueError, IndexError):
-                pass
 
-            # Clean output
-            stdout = self._clean(full, command, marker)
+            # Build command lines set for filtering echoes (first occurrence only)
+            cmd_lines = {}
+            for line in command.split('\n'):
+                s = line.strip()
+                if s:
+                    cmd_lines[s] = cmd_lines.get(s, 0) + 1
+
+            for line in lines:
+                stripped = line.strip()
+
+                # Check for start marker
+                if start_marker in stripped:
+                    started = True
+                    continue
+
+                if not started:
+                    continue
+
+                # Check for end marker line (must start with it, not command echo)
+                if stripped.startswith(end_marker_prefix):
+                    try:
+                        suffix = stripped[len(end_marker_prefix):]
+                        # Format: {exit_code}{cwd}___
+                        if suffix.endswith("___"):
+                            suffix = suffix[:-3]
+                            # Find where cwd starts (first /)
+                            slash_idx = suffix.find('/')
+                            if slash_idx != -1:
+                                exit_code = int(suffix[:slash_idx])
+                                cwd = suffix[slash_idx:]
+                            else:
+                                exit_code = int(suffix)
+                    except (ValueError, IndexError):
+                        pass
+                    break
+
+                # Skip command echoes (first occurrence only)
+                if stripped in cmd_lines and cmd_lines[stripped] > 0:
+                    cmd_lines[stripped] -= 1
+                    continue
+
+                # Skip internal markers
+                if "__ec__=$?" in stripped:
+                    continue
+
+                stdout_parts.append(line)
+
+            stdout = '\n'.join(stdout_parts).strip()
             return ExecuteResponse(stdout=stdout, stderr="", exit_code=exit_code, cwd=cwd)
-
-    def _clean(self, output: str, command: str, marker: str) -> str:
-        lines = []
-        for line in output.split('\n'):
-            if any(x in line for x in [marker, "__EXIT__", "__CWD__", "_ec=$?"]):
-                continue
-            if line.strip() == command.strip():
-                continue
-            if line.strip().startswith("echo "):
-                continue
-            lines.append(line)
-        import re
-        result = '\n'.join(lines).strip()
-        result = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', result)
-        return result.replace('\r', '')
 
 
 shell: PersistentShell | None = None
