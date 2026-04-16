@@ -30,7 +30,11 @@ from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', stream=sys.stdout)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -50,7 +54,9 @@ class PersistentShell:
     """Maintains a persistent shell using PTY."""
 
     # ANSI escape sequence regex for cleaning terminal output
-    _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[a-zA-Z@-~]|\x1b\[\?[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x07|\r')
+    _ANSI_RE = re.compile(
+        r"\x1b\[[0-9;]*[a-zA-Z@-~]|\x1b\[\?[0-9;]*[a-zA-Z]|\x1b\][^\x07]*\x07|\x07|\r"
+    )
 
     def __init__(self):
         self.master_fd: int | None = None
@@ -72,7 +78,10 @@ class PersistentShell:
             await asyncio.sleep(0.2)
             self._read_all()
             # Disable prompts
-            os.write(self.master_fd, b"export PS1='' PS2='' PS3='' PS4=''; unset PROMPT_COMMAND\n")
+            os.write(
+                self.master_fd,
+                b"export PS1='' PS2='' PS3='' PS4=''; unset PROMPT_COMMAND; stty -echo\n",
+            )
             await asyncio.sleep(0.1)
             self._read_all()
             self._initialized = True
@@ -96,12 +105,12 @@ class PersistentShell:
             try:
                 data = os.read(self.master_fd, 4096)
                 if data:
-                    output.append(data.decode('utf-8', errors='replace'))
+                    output.append(data.decode("utf-8", errors="replace"))
                 else:
                     break
             except OSError:
                 break
-        return ''.join(output)
+        return "".join(output)
 
     async def execute(self, command: str, timeout: int = 60) -> ExecuteResponse:
         async with self._lock:
@@ -118,7 +127,7 @@ class PersistentShell:
             wrapped = (
                 f"echo '{start_marker}'\n"
                 f"{command}\n"
-                f"__ec__=$?; echo \"{end_marker_prefix}$__ec__$(pwd)___\"\n"
+                f'__ec__=$?; echo "{end_marker_prefix}$__ec__$(pwd)___"\n'
             )
             os.write(self.master_fd, wrapped.encode())
 
@@ -130,17 +139,19 @@ class PersistentShell:
                 chunk = self._read_all(0.1)
                 if chunk:
                     output.append(chunk)
-                if end_marker_prefix in ''.join(output):
+                if end_marker_prefix in "".join(output):
                     break
             else:
-                return ExecuteResponse(stdout=''.join(output), stderr="timeout", exit_code=-1, cwd="")
+                return ExecuteResponse(
+                    stdout="".join(output), stderr="timeout", exit_code=-1, cwd=""
+                )
 
-            raw = ''.join(output)
+            raw = "".join(output)
             # Clean ANSI sequences
-            cleaned = self._ANSI_RE.sub('', raw)
+            cleaned = self._ANSI_RE.sub("", raw)
 
             # Parse output line by line
-            lines = cleaned.split('\n')
+            lines = cleaned.split("\n")
             stdout_parts = []
             started = False
             exit_code = 0
@@ -148,7 +159,7 @@ class PersistentShell:
 
             # Build command lines set for filtering echoes (first occurrence only)
             cmd_lines = {}
-            for line in command.split('\n'):
+            for line in command.split("\n"):
                 s = line.strip()
                 if s:
                     cmd_lines[s] = cmd_lines.get(s, 0) + 1
@@ -167,12 +178,12 @@ class PersistentShell:
                 # Check for end marker line (must start with it, not command echo)
                 if stripped.startswith(end_marker_prefix):
                     try:
-                        suffix = stripped[len(end_marker_prefix):]
+                        suffix = stripped[len(end_marker_prefix) :]
                         # Format: {exit_code}{cwd}___
                         if suffix.endswith("___"):
                             suffix = suffix[:-3]
                             # Find where cwd starts (first /)
-                            slash_idx = suffix.find('/')
+                            slash_idx = suffix.find("/")
                             if slash_idx != -1:
                                 exit_code = int(suffix[:slash_idx])
                                 cwd = suffix[slash_idx:]
@@ -193,8 +204,10 @@ class PersistentShell:
 
                 stdout_parts.append(line)
 
-            stdout = '\n'.join(stdout_parts).strip()
-            return ExecuteResponse(stdout=stdout, stderr="", exit_code=exit_code, cwd=cwd)
+            stdout = "\n".join(stdout_parts).strip()
+            return ExecuteResponse(
+                stdout=stdout, stderr="", exit_code=exit_code, cwd=cwd
+            )
 
 
 shell: PersistentShell | None = None
@@ -234,7 +247,7 @@ async def upload(file: UploadFile = File(...)):
 
 @app.get("/download/{path:path}")
 async def download(path: str):
-    full = path if path.startswith('/') else os.path.join("/workspace", path)
+    full = path if path.startswith("/") else os.path.join("/workspace", path)
     if os.path.isfile(full):
         return FileResponse(full, filename=os.path.basename(path))
     return JSONResponse(status_code=404, content={"message": "not found"})

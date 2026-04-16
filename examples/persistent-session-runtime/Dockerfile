@@ -13,7 +13,7 @@
 # limitations under the License.
 
 # Use the official Python image as the base image
-FROM python:3.11-slim
+FROM python:3.12.11
 
 # Install system dependencies for PTY support and uv
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -22,6 +22,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     gnupg \
     ripgrep \
+    pandoc \
+    libreoffice \
+    poppler-utils \
+    qpdf \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (LTS version) for npx support
