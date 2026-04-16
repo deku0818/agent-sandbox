@@ -33,8 +33,27 @@ rules:
 - apiGroups:
   - agents.x-k8s.io
   resources:
+  - sandboxes/finalizers
   - sandboxes/status
   verbs:
   - get
   - patch
   - update
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch

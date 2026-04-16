@@ -28,12 +28,24 @@ spec:
             type: object
           spec:
             properties:
+              additionalPodMetadata:
+                properties:
+                  annotations:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  labels:
+                    additionalProperties:
+                      type: string
+                    type: object
+                type: object
               lifecycle:
                 properties:
                   shutdownPolicy:
                     default: Retain
                     enum:
                     - Delete
+                    - DeleteForeground
                     - Retain
                     type: string
                   shutdownTime:
@@ -47,6 +59,9 @@ spec:
                 required:
                 - name
                 type: object
+              warmpool:
+                default: default
+                type: string
             required:
             - sandboxTemplateRef
             type: object
@@ -90,8 +105,12 @@ spec:
                 type: array
               sandbox:
                 properties:
-                  Name:
+                  name:
                     type: string
+                  podIPs:
+                    items:
+                      type: string
+                    type: array
                 type: object
             type: object
         required:

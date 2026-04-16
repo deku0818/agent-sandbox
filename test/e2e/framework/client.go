@@ -22,8 +22,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"reflect"
 	"strings"
-	"testing"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -31,21 +31,40 @@ import (
 	apiextensionsv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/dynamic"
+	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+	sandboxextensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/test/e2e/framework/predicates"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/yaml"
 )
 
 const (
-	// DefaultTimeout is the default timeout for WaitForObject.
+	// DefaultTimeout is the default timeout for WaitForObject and WaitForObjectNotFound.
 	DefaultTimeout = 60 * time.Second
 )
 
 // ClusterClient is an abstraction layer for test cases to interact with the cluster.
 type ClusterClient struct {
-	*testing.T
-	client client.Client
+	T
+	client        client.Client
+	dynamicClient dynamic.Interface
+	scheme        *runtime.Scheme
+	watchSet      *WatchSet
+}
+
+// WatchSet is a shared set of watches for the ClusterClient to use.
+func (cl *ClusterClient) WatchSet() *WatchSet {
+	return cl.watchSet
+}
+
+// DynamicClient returns the dynamic client backing the test framework.
+func (cl *ClusterClient) DynamicClient() dynamic.Interface {
+	return cl.dynamicClient
 }
 
 // List retrieves a list of objects matching the provided options.
@@ -88,6 +107,27 @@ func (cl *ClusterClient) Update(ctx context.Context, obj client.Object) error {
 	return nil
 }
 
+// MustUpdateObject updates the specified object, using the provided updateFunc to modify
+// the object.  This ensures that we always update the latest version of the object from the cluster.
+// In future we might support automatic retries on optimistic-concurrency "misses".
+func MustUpdateObject[T client.Object](cl *ClusterClient, obj T, updateFunc func(obj T)) {
+	cl.Helper()
+
+	ctx := cl.Context()
+
+	id := types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
+	latest := reflect.New(reflect.TypeOf(obj).Elem()).Interface().(T)
+	if err := cl.Get(ctx, id, latest); err != nil {
+		cl.Fatalf("MustUpdateObject: failed to get latest %T (%s): %v", obj, id.String(), err)
+	}
+
+	updateFunc(latest)
+
+	if err := cl.Update(ctx, latest); err != nil {
+		cl.Fatalf("MustUpdateObject: failed to update %T (%s): %v", obj, id.String(), err)
+	}
+}
+
 // CreateWithCleanup creates the specified object and cleans up the object after
 // the test completes.
 func (cl *ClusterClient) CreateWithCleanup(ctx context.Context, obj client.Object) error {
@@ -111,21 +151,65 @@ func (cl *ClusterClient) CreateWithCleanup(ctx context.Context, obj client.Objec
 	return nil
 }
 
-// ValidateObject verifies the specified object exists and satisfies the provided
+// MustCreateWithCleanup is a wrapper around CreateWithCleanup that fails the test on error.
+func (cl *ClusterClient) MustCreateWithCleanup(obj client.Object) {
+	cl.Helper()
+	ctx := cl.Context()
+
+	if err := cl.CreateWithCleanup(ctx, obj); err != nil {
+		cl.Fatalf("MustCreateWithCleanup(%T) failed with: %v", obj, err)
+	}
+}
+
+// MatchesPredicates verifies the specified object exists and satisfies the provided
 // predicates.
-func (cl *ClusterClient) ValidateObject(ctx context.Context, obj client.Object, p ...predicates.ObjectPredicate) error {
+func (cl *ClusterClient) MatchesPredicates(ctx context.Context, obj client.Object, p ...predicates.ObjectPredicate) (bool, error) {
 	cl.Helper()
 	nn := types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
-	cl.Logf("ValidateObject %T (%s)", obj, nn.String())
+	cl.Logf("MatchesPredicates %T (%s)", obj, nn.String())
 	if err := cl.client.Get(ctx, nn, obj); err != nil {
-		return fmt.Errorf("ValidateObject %T (%s): %w", obj, nn.String(), err)
+		return false, fmt.Errorf("MatchesPredicates %T (%s): %w", obj, nn.String(), err)
 	}
 	for _, predicate := range p {
-		if err := predicate(obj); err != nil {
-			return fmt.Errorf("ValidateObject %T (%s): %w", obj, nn.String(), err)
+		predicateMatches, err := predicate.Matches(obj)
+		if err != nil {
+			return false, fmt.Errorf("MatchesPredicates %T (%s): %w", obj, nn.String(), err)
+		}
+		if !predicateMatches {
+			return false, nil
 		}
 	}
-	return nil
+	return true, nil
+}
+
+// MustMatchPredicates is a wrapper around MatchesPredicates that fails the test if the object
+// does not exist, if the predicates are not satisfied or if there is an error during evaluation.
+func (cl *ClusterClient) MustMatchPredicates(obj client.Object, p ...predicates.ObjectPredicate) {
+	cl.Helper()
+	ctx := cl.Context()
+
+	matchesPredicates, err := cl.MatchesPredicates(ctx, obj, p...)
+	if err != nil {
+		cl.Fatalf("MustMatchPredicates(%T) failed with: %v", obj, err)
+	}
+	if !matchesPredicates {
+		cl.Fatalf("MustMatchPredicates(%T) predicates not satisfied", obj)
+	}
+}
+
+// MustExist fails the test if the object does not exist.
+func (cl *ClusterClient) MustExist(obj client.Object) {
+	cl.Helper()
+	ctx := cl.Context()
+
+	// We call MatchesPredicates without any predicates to just check for existence
+	matchesPredicates, err := cl.MatchesPredicates(ctx, obj)
+	if err != nil {
+		cl.Fatalf("MustExist(%T) failed with: %v", obj, err)
+	}
+	if !matchesPredicates {
+		cl.Fatalf("MustExist(%T) object does not exist", obj)
+	}
 }
 
 // ValidateObjectNotFound verifies the specified object does not exist.
@@ -144,29 +228,34 @@ func (cl *ClusterClient) ValidateObjectNotFound(ctx context.Context, obj client.
 	return nil // happy path - object not found
 }
 
-// WaitForObject waits for the specified object to exist and satisfy the provided
-// predicates.
-func (cl *ClusterClient) WaitForObject(ctx context.Context, obj client.Object, p ...predicates.ObjectPredicate) error {
+// PollUntilObjectMatches polls for the specified object to exist and satisfy the provided
+// predicates. Use WaitForObject for more precise timing via watches.
+func (cl *ClusterClient) PollUntilObjectMatches(obj client.Object, p ...predicates.ObjectPredicate) error {
 	cl.Helper()
-	var cancel context.CancelFunc
-	if _, ok := ctx.Deadline(); !ok {
-		ctx, cancel = context.WithTimeout(ctx, DefaultTimeout)
-		defer cancel()
+	ctx := cl.Context()
+
+	timeout := DefaultTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < timeout {
+			timeout = remaining
+		}
 	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	start := time.Now()
 	nn := types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
-	defer func() {
-		cl.Helper()
-		cl.Logf("WaitForObject %T (%s) took %s", obj, nn, time.Since(start))
-	}()
-	var validationErr error
 	for {
 		select {
 		case <-ctx.Done():
 			cl.Logf("Timed out waiting for object %s/%s", obj.GetNamespace(), obj.GetName())
-			return fmt.Errorf("timed out waiting for object: %w", validationErr)
+			return fmt.Errorf("timed out waiting for object %s/%s", obj.GetNamespace(), obj.GetName())
 		default:
-			if validationErr = cl.ValidateObject(ctx, obj, p...); validationErr == nil {
+			matchesPredicates, validationErr := cl.MatchesPredicates(ctx, obj, p...)
+			if validationErr != nil {
+				return validationErr
+			}
+			if matchesPredicates {
+				cl.Logf("PollUntilObject %T (%s) took %s", obj, nn, time.Since(start))
 				return nil
 			}
 			// Simple sleep for fixed duration (basic MVP)
@@ -175,11 +264,230 @@ func (cl *ClusterClient) WaitForObject(ctx context.Context, obj client.Object, p
 	}
 }
 
+// WaitForObject waits for the specified object to exist and satisfy
+// the provided predicates.
+// It will wait for the object to be created, but if the object is deleted,
+// it will return an error.
+// The timeout is capped at DefaultTimeout (1 minute). A shorter timeout can
+// be specified via the context.
+// It uses a watch for more precise timing than polling.
+// It uses a shared WatchSet to avoid per-call watch setup latency.
+func (cl *ClusterClient) WaitForObject(ctx context.Context, obj client.Object, p ...predicates.ObjectPredicate) error {
+	cl.Helper()
+
+	timeout := DefaultTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if remaining := time.Until(deadline); remaining < timeout {
+			timeout = remaining
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	start := time.Now()
+	nn := types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
+
+	// First check if the object already satisfies the predicates
+	if valid, validationErr := cl.MatchesPredicates(ctx, obj, p...); validationErr == nil && valid {
+		return nil
+	}
+
+	gvk, err := gvkForObject(obj)
+	if err != nil {
+		cl.Fatalf("failed to get GVK: %v", err)
+	}
+
+	gvr, err := gvrForGVK(gvk)
+	if err != nil {
+		cl.Fatalf("failed to get GVR for GVK %v: %v", gvk, err)
+	}
+
+	watchFilter := WatchFilter{Namespace: obj.GetNamespace(), Name: obj.GetName()}
+
+	var lastNotMatching []predicates.ObjectPredicate
+	var lastObject *unstructured.Unstructured
+	done, err := Watch(ctx, cl, gvr, watchFilter, func(event watch.Event, obj *unstructured.Unstructured) (bool, error) {
+		if event.Type == watch.Deleted {
+			return false, fmt.Errorf("object was deleted while waiting for predicates to be satisfied")
+		}
+
+		// Check if predicates are satisfied
+		var notMatching []predicates.ObjectPredicate
+		for _, predicate := range p {
+			if match, err := predicate.Matches(obj); err != nil {
+				return false, err
+			} else if !match {
+				notMatching = append(notMatching, predicate)
+			}
+		}
+
+		lastNotMatching = notMatching
+		lastObject = obj.DeepCopy()
+
+		return len(notMatching) == 0, nil
+	})
+
+	if lastObject == nil {
+		cl.Logf("no matching object observed")
+	} else {
+		y, err := yaml.Marshal(lastObject)
+		if err != nil {
+			cl.Errorf("failed to marshal last object state: %v", err)
+		} else {
+			cl.Logf("last object state: %v", string(y))
+		}
+	}
+
+	if err != nil {
+		return err
+	}
+	if !done {
+		// Predicates not satisfied within timeout
+		return fmt.Errorf("object did not satisfy predicates: %v", lastNotMatching)
+	}
+	cl.Logf("WaitForObject %T (%s) took %s", obj, nn, time.Since(start))
+	return nil
+}
+
+// Watch calls a callback whenever the specified object changes,
+// using a shared WatchSet to avoid per-call watch setup latency.
+// Callback is called for each event, and if the callback returns true or an error, the watch will stop and the value will be returned.
+func (cl *ClusterClient) Watch(ctx context.Context, gvr schema.GroupVersionResource, filter WatchFilter, callback func(event watch.Event) (bool, error)) (bool, error) {
+	// Subscribe using the watchSet, ideally reusing an existing watch
+	sub := cl.watchSet.Subscribe(gvr, filter)
+	defer sub.Close()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return false, fmt.Errorf("timed out watching object: %w", ctx.Err())
+
+		case event, ok := <-sub.Events:
+			if !ok {
+				return false, fmt.Errorf("subscription closed during watch of %v", gvr)
+			}
+
+			if event.Type == watch.Error {
+				return false, fmt.Errorf("received error event during watch of %v", gvr)
+			}
+
+			if done, err := callback(event); done || err != nil {
+				return done, err
+			}
+		}
+	}
+}
+
+// Watch calls a callback whenever the specified object changes,
+// using a shared WatchSet to avoid per-call watch setup latency.
+// It is a wrapper around ClusterClient Watch that converts to a strongly-typed object in the callback.
+func Watch[T client.Object](ctx context.Context, cl *ClusterClient, gvr schema.GroupVersionResource, watchFilter WatchFilter, callback func(event watch.Event, obj T) (bool, error)) (bool, error) {
+	return cl.Watch(ctx, gvr, watchFilter, func(event watch.Event) (bool, error) {
+		switch event.Type {
+		case watch.Added, watch.Modified, watch.Deleted:
+		// ok
+		case watch.Bookmark:
+			// Ignore
+			return false, nil
+		default:
+			return false, fmt.Errorf("unexpected watch event type: %v", event.Type)
+		}
+
+		u, ok := event.Object.(*unstructured.Unstructured)
+		if !ok {
+			return false, fmt.Errorf("unexpected type for event object: %T", event.Object)
+		}
+
+		var t T
+
+		switch any(t).(type) {
+		case *unstructured.Unstructured:
+			return callback(event, any(u).(T))
+		default:
+			// Copy the unstructured data to the provided object
+			if err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.Object, &t); err != nil {
+				return false, fmt.Errorf("failed to convert unstructured to object: %w", err)
+			}
+
+			return callback(event, t)
+		}
+	})
+}
+
+// MustWatch is a wrapper around WatchObject that fails the test on error.
+func MustWatch[T client.Object](ctx context.Context, cl *ClusterClient, gvr schema.GroupVersionResource, watchFilter WatchFilter, callback func(event watch.Event, obj T) (bool, error)) bool {
+	cl.Helper()
+
+	done, err := Watch(ctx, cl, gvr, watchFilter, callback)
+	if err != nil {
+		// Only fail the test if this isn't the normal "context cancelled" shutdown error.
+		if !errors.Is(err, context.Canceled) {
+			cl.Fatalf("Watch(%v, %+v) failed with: %v", gvr, watchFilter, err)
+		}
+	}
+	return done
+}
+
+// gvkForObject returns the GroupVersionKind for the given object.
+func gvkForObject(obj runtime.Object) (schema.GroupVersionKind, error) {
+	gvk := obj.GetObjectKind().GroupVersionKind()
+	if gvk.Kind != "" {
+		return gvk, nil
+	}
+
+	switch o := obj.(type) {
+	case *corev1.Pod:
+		return schema.GroupVersionKind{Group: "", Version: "v1", Kind: "Pod"}, nil
+	case *appsv1.Deployment:
+		return schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}, nil
+	case *sandboxv1alpha1.Sandbox:
+		return sandboxGVK, nil
+	case *sandboxextensionsv1alpha1.SandboxWarmPool:
+		return sandboxWarmpoolGVK, nil
+	case *sandboxextensionsv1alpha1.SandboxClaim:
+		return sandboxClaimGVK, nil
+	default:
+		return schema.GroupVersionKind{}, fmt.Errorf("no GVK found for object type %T", o)
+	}
+}
+
+// gvrForGVK returns the GroupVersionResource for the given GroupVersionKind.
+func gvrForGVK(gvk schema.GroupVersionKind) (schema.GroupVersionResource, error) {
+	// We use a hard-coded list rather than going through discovery for simplicity and speed.
+	gv := gvk.GroupVersion()
+	switch gvk.GroupKind() {
+	case sandboxGVK.GroupKind():
+		return gv.WithResource("sandboxes"), nil
+	case sandboxWarmpoolGVK.GroupKind():
+		return gv.WithResource("sandboxwarmpools"), nil
+	case schema.GroupKind{Kind: "Pod"}:
+		return gv.WithResource("pods"), nil
+	case schema.GroupKind{Kind: "Deployment", Group: "apps"}:
+		return gv.WithResource("deployments"), nil
+	case schema.GroupKind{Kind: "Namespace"}:
+		return gv.WithResource("namespaces"), nil
+	case schema.GroupKind{Kind: "SandboxClaim", Group: "extensions.agents.x-k8s.io"}:
+		return gv.WithResource("sandboxclaims"), nil
+	default:
+		return schema.GroupVersionResource{}, fmt.Errorf("unknown GVK %v in gvrForGVK", gvk)
+	}
+}
+
+// MustWaitForObject is a wrapper around WaitForObject that fails the test on error.
+func (cl *ClusterClient) MustWaitForObject(obj client.Object, p ...predicates.ObjectPredicate) {
+	cl.Helper()
+	ctx := cl.Context()
+
+	if err := cl.WaitForObject(ctx, obj, p...); err != nil {
+		cl.Fatalf("MustWaitForObject(%T, %v) failed with: %v", obj, p, err)
+	}
+}
+
 // WaitForObjectNotFound waits for the specified object to not exist.
 func (cl *ClusterClient) WaitForObjectNotFound(ctx context.Context, obj client.Object) error {
 	cl.Helper()
-	// Static 30 second timeout, this can be adjusted if needed
-	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// Static 1 minute timeout, this can be adjusted if needed
+	timeoutCtx, cancel := context.WithTimeout(ctx, DefaultTimeout)
+
 	defer cancel()
 	start := time.Now()
 	nn := types.NamespacedName{Name: obj.GetName(), Namespace: obj.GetNamespace()}
@@ -204,7 +512,7 @@ func (cl *ClusterClient) WaitForObjectNotFound(ctx context.Context, obj client.O
 
 // validateAgentSandboxInstallation verifies agent-sandbox system components are
 // installed.
-func (cl *ClusterClient) validateAgentSandboxInstallation(ctx context.Context) error {
+func (cl *ClusterClient) validateAgentSandboxInstallation() error {
 	cl.Helper()
 	// verify CRDs exist
 	crds := []string{
@@ -216,27 +524,21 @@ func (cl *ClusterClient) validateAgentSandboxInstallation(ctx context.Context) e
 	for _, name := range crds {
 		crd := &apiextensionsv1.CustomResourceDefinition{}
 		crd.Name = name
-		if err := cl.ValidateObject(ctx, crd); err != nil {
-			return fmt.Errorf("expected %T (%s) to exist: %w", crd, name, err)
-		}
+		cl.MustExist(crd)
 	}
 	// verify agent-sandbox-system namespace exists
 	ns := &corev1.Namespace{}
 	ns.Name = "agent-sandbox-system"
-	if err := cl.ValidateObject(ctx, ns); err != nil {
-		return fmt.Errorf("expected %T (%s) to exist: %w", ns, ns.Name, err)
-	}
+	cl.MustExist(ns)
 	// verify agent-sandbox-controller exists
 	ctrlNN := types.NamespacedName{
 		Name:      "agent-sandbox-controller",
 		Namespace: ns.Name,
 	}
-	ctrl := &appsv1.StatefulSet{}
+	ctrl := &appsv1.Deployment{}
 	ctrl.Name = ctrlNN.Name
 	ctrl.Namespace = ctrlNN.Namespace
-	if err := cl.ValidateObject(ctx, ctrl); err != nil {
-		return fmt.Errorf("expected %T (%s) to exist: %w", ctrl, ctrlNN.String(), err)
-	}
+	cl.MustExist(ctrl)
 	return nil
 }
 
@@ -265,7 +567,7 @@ func (cl *ClusterClient) PortForward(ctx context.Context, pod types.NamespacedNa
 			cl.Errorf("failed to kill port-forward: %s", err)
 		}
 	}
-	cl.T.Cleanup(stopProcess)
+	cl.Cleanup(stopProcess)
 
 	go func() {
 		cl.Helper()
@@ -307,6 +609,12 @@ var sandboxWarmpoolGVK = schema.GroupVersionKind{
 	Kind:    "SandboxWarmPool",
 }
 
+var sandboxClaimGVK = schema.GroupVersionKind{
+	Group:   "extensions.agents.x-k8s.io",
+	Version: "v1alpha1",
+	Kind:    "SandboxClaim",
+}
+
 func (cl *ClusterClient) WaitForSandboxReady(ctx context.Context, sandboxID types.NamespacedName) error {
 	sandbox := &unstructured.Unstructured{}
 	sandbox.SetGroupVersionKind(sandboxGVK)
@@ -328,12 +636,12 @@ func (cl *ClusterClient) WaitForWarmPoolReady(ctx context.Context, sandboxWarmpo
 	warmpool := &unstructured.Unstructured{}
 	warmpool.SetGroupVersionKind(sandboxWarmpoolGVK)
 	if err := cl.client.Get(ctx, sandboxWarmpoolID, warmpool); err != nil {
-		cl.T.Fatalf("Failed to get SandboxWarmPool %s: %v", sandboxWarmpoolID, err)
+		cl.Fatalf("Failed to get SandboxWarmPool %s: %v", sandboxWarmpoolID, err)
 		return err
 	}
 
 	if err := cl.WaitForObject(ctx, warmpool, predicates.ReadyReplicasConditionIsTrue); err != nil {
-		cl.T.Fatalf("waiting for warmpool to be ready: %v", err)
+		cl.Fatalf("waiting for warmpool to be ready: %v", err)
 		return err
 	}
 	return nil
@@ -352,4 +660,27 @@ func (cl *ClusterClient) GetSandbox(ctx context.Context, sandboxID types.Namespa
 		return nil, err
 	}
 	return sandbox, nil
+}
+
+// ExecuteOnNode executes a command on a node.
+// nodeName should be the Kubernetes node name (e.g., "agent-sandbox-control-plane").
+// This function assumes we're running on kind, we'll need to adjust this (for example to use SSH) if we want to run on other platforms.
+// For kind, it uses "docker exec" to run the command in the kind node container.
+func (cl *ClusterClient) ExecuteOnNode(ctx context.Context, nodeName string, command []string) (string, string, error) {
+	cl.Helper()
+
+	args := append([]string{"exec", nodeName}, command...)
+	cmd := exec.CommandContext(ctx, "docker", args...)
+	cl.Logf("executing on kind node: docker %s", strings.Join(args, " "))
+
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	if err != nil {
+		return stdout.String(), stderr.String(), fmt.Errorf("docker exec failed: %w (stderr: %s)", err, stderr.String())
+	}
+
+	return stdout.String(), stderr.String(), nil
 }
