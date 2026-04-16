@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.1] - 2026-04-16
+
+### Fixed
+- Dockerfile 修复 /opt/.runtime 目录权限，chown 到 1000:1000 以便非 root 用户访问
+- `get_safe_path` 支持绝对路径（如 `/workspace/foo.md`）和相对路径（如 `foo.md`），避免绝对路径被错误拼接
+
 ## [0.2.0] - 2026-04-16
 
 ### Changed

@@ -39,6 +39,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 # Copy API service to a hidden system directory
 COPY pyproject.toml main.py /opt/.runtime/
 RUN uv pip install --system --no-cache -r /opt/.runtime/pyproject.toml \
+    && chown -R 1000:1000 /opt/.runtime \
     && chmod 500 /opt/.runtime
 
 # Set Python path environment variable
