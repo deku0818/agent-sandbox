@@ -1,4 +1,4 @@
-# Copyright 2025 The Kubernetes Authors.
+# Copyright 2026 The Kubernetes Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -15,7 +15,7 @@
 # Use the official Python image as the base image
 FROM python:3.12.11
 
-# Install system dependencies for PTY support and uv
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     procps \
     curl \
@@ -44,13 +44,11 @@ RUN uv pip install --system --no-cache -r /opt/.runtime/pyproject.toml \
 # Set Python path environment variable
 ENV PYTHONPATH=/workspace
 
-# Set pip source to Tsinghua mirror
-ENV PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
-
 # Create user workspace
 RUN mkdir -p /workspace && chown 1000:1000 /workspace
 
 WORKDIR /workspace
+USER 1000
 EXPOSE 8888
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8888", "--log-level", "info", "--app-dir", "/opt/.runtime"]

@@ -1,7 +1,7 @@
 [project]
-name = "persistent-session-runtime"
-version = "0.1.1"
-description = "A runtime that maintains a persistent shell session across command executions"
+name = "omniagent-sandbox"
+version = "0.2.0"
+description = "OmniAgent sandbox runtime: per-command subprocess with cwd persistence"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

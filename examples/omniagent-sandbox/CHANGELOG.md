@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0] - 2026-04-16
+
+### Changed
+- **Breaking**: 从持久 PTY shell 改为 per-command subprocess 模型
+- 删除 PersistentShell 类（PTY fork、marker 协议、ANSI 清理、echo 过滤）
+- 只持久化工作目录（cwd），每次 execute 启动新 bash 进程
+- 项目重命名为 omniagent-sandbox
+
 ## [0.1.1] - 2026-04-16
 
 ### Added

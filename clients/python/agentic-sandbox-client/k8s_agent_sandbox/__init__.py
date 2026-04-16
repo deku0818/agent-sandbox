@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from .sandbox_client import SandboxClient
-from .persistent_client import PersistentSandboxClient
+from .omniagent_sandbox_client import OmniAgentSandboxClient
 from .exceptions import (
     SandboxError,
     SandboxNotFoundError,
@@ -27,8 +27,10 @@ from .exceptions import (
 try:
     from .async_sandbox_client import AsyncSandboxClient
 except ImportError:
+
     class AsyncSandboxClient:  # type: ignore[no-redef]
         """Placeholder that raises ImportError when async extras are missing."""
+
         def __init__(self, *args, **kwargs):
             raise ImportError(
                 "AsyncSandboxClient requires the 'async' extras. "

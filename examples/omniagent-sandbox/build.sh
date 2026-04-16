@@ -1,12 +1,12 @@
 #!/bin/bash
 
 # Docker 镜像构建和推送脚本
-# 目标仓库: aidong-backend.tencentcloudcr.com/llm/persistent-session-sandbox
+# 目标仓库: aidong-backend.tencentcloudcr.com/llm/omniagent-sandbox
 
 set -e
 
 REGISTRY="aidong-backend.tencentcloudcr.com"
-IMAGE_NAME="llm/persistent-session-sandbox"
+IMAGE_NAME="llm/omniagent-sandbox"
 FULL_IMAGE="${REGISTRY}/${IMAGE_NAME}"
 
 # 获取版本标签，默认使用 latest
