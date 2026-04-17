@@ -35,23 +35,28 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 WORKSPACE_DIR = "/workspace"
+ALLOWED_DIRS = ("/workspace", "/tmp")
 CWD_SENTINEL = "___OMNIAGENT_CWD___"
 
 
 def get_safe_path(file_path: str) -> str:
-    """Sanitizes the file path to ensure it stays within /workspace.
+    """Sanitizes the file path to ensure it stays within allowed directories.
 
-    Accepts both absolute paths (e.g. /workspace/foo.md) and relative paths
-    (e.g. foo.md, treated as relative to /workspace).
+    Accepts absolute paths under any of ``ALLOWED_DIRS`` (e.g. ``/workspace/foo.md``
+    or ``/tmp/bar.py``), and relative paths (e.g. ``foo.md``, treated as relative
+    to ``/workspace``).
     """
-    base_dir = os.path.realpath(WORKSPACE_DIR)
     if os.path.isabs(file_path):
         full_path = os.path.realpath(file_path)
     else:
-        full_path = os.path.realpath(os.path.join(base_dir, file_path))
-    if os.path.commonpath([base_dir, full_path]) != base_dir:
-        raise ValueError("Access denied: Path must be within /workspace")
-    return full_path
+        full_path = os.path.realpath(os.path.join(WORKSPACE_DIR, file_path))
+
+    for base in ALLOWED_DIRS:
+        base_real = os.path.realpath(base)
+        if os.path.commonpath([base_real, full_path]) == base_real:
+            return full_path
+
+    raise ValueError(f"Access denied: Path must be within {', '.join(ALLOWED_DIRS)}")
 
 
 class ExecuteRequest(BaseModel):

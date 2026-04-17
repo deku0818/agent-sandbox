@@ -42,14 +42,28 @@ RUN uv pip install --system --no-cache -r /opt/.runtime/pyproject.toml \
     && chown -R 1000:1000 /opt/.runtime \
     && chmod 500 /opt/.runtime
 
-# Set Python path environment variable
-ENV PYTHONPATH=/workspace
+# Create agent user (UID 1000) and use /workspace as HOME. Since /workspace
+# is not mounted from outside, keeping everything the agent installs or
+# configures (npm global, pip --user, `lark login` tokens, shell history)
+# inside $HOME=/workspace makes the sandbox self-contained and mirrors a
+# real user's machine where dotfiles and working files coexist.
+RUN useradd -u 1000 -s /bin/bash -M -d /workspace agent \
+    && mkdir -p /workspace/.npm-global /workspace/.local/bin \
+    && chown -R agent:agent /workspace
 
-# Create user workspace
-RUN mkdir -p /workspace && chown 1000:1000 /workspace
+ENV HOME=/workspace
+ENV NPM_CONFIG_PREFIX=/workspace/.npm-global
+ENV PATH=/workspace/.npm-global/bin:/workspace/.local/bin:$PATH
+ENV PYTHONPATH=/workspace
 
 WORKDIR /workspace
 USER 1000
+
+# Install Lark (Feishu) CLI as the agent user so it lands in ~/.npm-global
+# and exercises the same install path the agent uses at runtime.
+RUN npm install -g @larksuite/cli \
+    && npm cache clean --force
+
 EXPOSE 8888
 
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8888", "--log-level", "info", "--app-dir", "/opt/.runtime"]
