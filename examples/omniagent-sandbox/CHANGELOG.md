@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.3] - 2026-04-21
+
+### Added
+- `ExecuteRequest` 新增 `env` 字段，客户端可在每次 execute 时注入自定义环境变量，容器侧将其与 `os.environ` 合并（用户值优先）后传给子进程
+- `OmniAgentSandboxClient.run` 新增 `env: dict[str, str] | None` 参数，向 sandbox 透传环境变量
+
+### Changed
+- `SandboxConnector` 的 HTTP `Session` 连接池提升至 `pool_connections=16, pool_maxsize=16`，避免同一 sandbox 的并发 execute 请求在 TCP 层串行阻塞
+
 ## [0.2.2] - 2026-04-17
 
 ### Added

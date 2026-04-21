@@ -62,6 +62,7 @@ def get_safe_path(file_path: str) -> str:
 class ExecuteRequest(BaseModel):
     command: str
     timeout: int = 60
+    env: dict[str, str] | None = None
 
 
 class ExecuteResponse(BaseModel):
@@ -90,11 +91,13 @@ async def execute(req: ExecuteRequest):
         f"{req.command}\n"
         f"__ec=$?; echo {CWD_SENTINEL}; pwd -P; exit $__ec"
     )
+    merged_env = {**os.environ, **req.env} if req.env else None
     proc = await asyncio.create_subprocess_shell(
         wrapped,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd="/workspace",
+        env=merged_env,
     )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(

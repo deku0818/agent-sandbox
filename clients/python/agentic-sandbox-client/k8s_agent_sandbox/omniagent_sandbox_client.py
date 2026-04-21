@@ -69,16 +69,28 @@ class OmniAgentSandboxClient:
         # Track active connectors: session_id -> SandboxConnector
         self._connectors: dict[str, SandboxConnector] = {}
 
-    def run(self, session_id: str, command: str, timeout: int = 60) -> ExecutionResult:
+    def run(
+        self,
+        session_id: str,
+        command: str,
+        timeout: int = 60,
+        env: dict[str, str] | None = None,
+    ) -> ExecutionResult:
         """
         Execute a command in the sandbox for the given session.
         Creates the sandbox automatically if it doesn't exist.
+
+        If ``env`` is provided, the sandbox runtime merges it with the
+        container's environ before launching the subprocess (user values win).
         """
         connector = self._ensure_sandbox(session_id)
+        payload: dict[str, object] = {"command": command, "timeout": timeout}
+        if env:
+            payload["env"] = env
         response = connector.send_request(
             "POST",
             "execute",
-            json={"command": command, "timeout": timeout},
+            json=payload,
             timeout=timeout + 10,
         )
         return ExecutionResult(**response.json())

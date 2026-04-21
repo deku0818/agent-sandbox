@@ -24,7 +24,7 @@ from .models import (
     SandboxConnectionConfig,
     SandboxDirectConnectionConfig,
     SandboxGatewayConnectionConfig,
-    SandboxLocalTunnelConnectionConfig
+    SandboxLocalTunnelConnectionConfig,
 )
 from .k8s_helper import K8sHelper
 from .exceptions import (
@@ -34,9 +34,10 @@ from .exceptions import (
 
 ROUTER_SERVICE_NAME = "svc/sandbox-router-svc"
 
+
 class ConnectionStrategy(ABC):
     """Abstract base class for connection strategies."""
-    
+
     @abstractmethod
     def connect(self) -> str:
         """Establishes the connection and returns the base URL."""
@@ -52,6 +53,7 @@ class ConnectionStrategy(ABC):
         """Checks if the connection is healthy. Raises SandboxPortForwardError if not."""
         pass
 
+
 class DirectConnectionStrategy(ConnectionStrategy):
     def __init__(self, config: SandboxDirectConnectionConfig):
         self.config = config
@@ -65,6 +67,7 @@ class DirectConnectionStrategy(ConnectionStrategy):
     def verify_connection(self):
         pass
 
+
 class GatewayConnectionStrategy(ConnectionStrategy):
     def __init__(self, config: SandboxGatewayConnectionConfig, k8s_helper: K8sHelper):
         self.config = config
@@ -74,11 +77,11 @@ class GatewayConnectionStrategy(ConnectionStrategy):
     def connect(self) -> str:
         if self.base_url:
             return self.base_url
-            
+
         ip_address = self.k8s_helper.wait_for_gateway_ip(
             self.config.gateway_name,
             self.config.gateway_namespace,
-            self.config.gateway_ready_timeout
+            self.config.gateway_ready_timeout,
         )
         self.base_url = f"http://{ip_address}"
         return self.base_url
@@ -89,8 +92,14 @@ class GatewayConnectionStrategy(ConnectionStrategy):
     def verify_connection(self):
         pass
 
+
 class LocalTunnelConnectionStrategy(ConnectionStrategy):
-    def __init__(self, sandbox_id: str, namespace: str, config: SandboxLocalTunnelConnectionConfig):
+    def __init__(
+        self,
+        sandbox_id: str,
+        namespace: str,
+        config: SandboxLocalTunnelConnectionConfig,
+    ):
         self.sandbox_id = sandbox_id
         self.namespace = namespace
         self.config = config
@@ -100,29 +109,34 @@ class LocalTunnelConnectionStrategy(ConnectionStrategy):
     def _get_free_port(self):
         """Finds a free port on localhost."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('127.0.0.1', 0))
+            s.bind(("127.0.0.1", 0))
             return s.getsockname()[1]
 
     def connect(self) -> str:
-        if self.base_url and self.port_forward_process and self.port_forward_process.poll() is None:
-             return self.base_url
+        if (
+            self.base_url
+            and self.port_forward_process
+            and self.port_forward_process.poll() is None
+        ):
+            return self.base_url
 
         if self.port_forward_process:
-             self.close()
+            self.close()
 
         local_port = self._get_free_port()
 
-        logging.info(
-            f"Starting tunnel for Sandbox {self.sandbox_id}")
+        logging.info(f"Starting tunnel for Sandbox {self.sandbox_id}")
         self.port_forward_process = subprocess.Popen(
             [
-                "kubectl", "port-forward",
+                "kubectl",
+                "port-forward",
                 ROUTER_SERVICE_NAME,
                 f"{local_port}:8080",
-                "-n", self.namespace
+                "-n",
+                self.namespace,
             ],
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stderr=subprocess.PIPE,
         )
 
         logging.info("Waiting for port-forwarding to be ready...")
@@ -131,7 +145,8 @@ class LocalTunnelConnectionStrategy(ConnectionStrategy):
             if self.port_forward_process.poll() is not None:
                 _, stderr = self.port_forward_process.communicate()
                 raise SandboxPortForwardError(
-                    f"Tunnel crashed: {stderr.decode(errors='replace')}")
+                    f"Tunnel crashed: {stderr.decode(errors='replace')}"
+                )
 
             try:
                 with socket.create_connection(("127.0.0.1", local_port), timeout=0.1):
@@ -148,7 +163,9 @@ class LocalTunnelConnectionStrategy(ConnectionStrategy):
     def close(self):
         if self.port_forward_process:
             try:
-                logging.info(f"Stopping port-forwarding for Sandbox {self.sandbox_id}...")
+                logging.info(
+                    f"Stopping port-forwarding for Sandbox {self.sandbox_id}..."
+                )
                 self.port_forward_process.terminate()
                 try:
                     self.port_forward_process.wait(timeout=2)
@@ -168,10 +185,12 @@ class LocalTunnelConnectionStrategy(ConnectionStrategy):
                 f"Stderr: {stderr.decode(errors='replace')}"
             )
 
+
 class SandboxConnector:
     """
     Manages the connection to the Sandbox, including auto-discovery and port-forwarding.
     """
+
     def __init__(
         self,
         sandbox_id: str,
@@ -184,21 +203,29 @@ class SandboxConnector:
         self.namespace = namespace
         self.connection_config = connection_config
         self.k8s_helper = k8s_helper
-        
+
         # Connection strategy initialization
         self.strategy = self._connection_strategy()
-        
+
         # HTTP Session setup
+        # pool_connections / pool_maxsize 提升到 16，支持同一 sandbox 并发
+        # 多条 execute 请求（容器侧 FastAPI + uvicorn 原生并发，客户端默认
+        # 单连接 keepalive 会让多条并发请求在 TCP 层串行）。
         self.session = requests.Session()
         retries = Retry(
             total=5,
             backoff_factor=0.5,
             status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["GET", "POST", "PUT", "DELETE"]
+            allowed_methods=["GET", "POST", "PUT", "DELETE"],
         )
-        self.session.mount("http://", HTTPAdapter(max_retries=retries))
-        self.session.mount("https://", HTTPAdapter(max_retries=retries))
-        
+        self.session.mount(
+            "http://",
+            HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=retries),
+        )
+        self.session.mount(
+            "https://",
+            HTTPAdapter(pool_connections=16, pool_maxsize=16, max_retries=retries),
+        )
 
     def _connection_strategy(self):
         if isinstance(self.connection_config, SandboxDirectConnectionConfig):
@@ -206,7 +233,9 @@ class SandboxConnector:
         elif isinstance(self.connection_config, SandboxGatewayConnectionConfig):
             return GatewayConnectionStrategy(self.connection_config, self.k8s_helper)
         elif isinstance(self.connection_config, SandboxLocalTunnelConnectionConfig):
-            return LocalTunnelConnectionStrategy(self.id, self.namespace, self.connection_config)
+            return LocalTunnelConnectionStrategy(
+                self.id, self.namespace, self.connection_config
+            )
         else:
             raise ValueError("Unknown connection configuration type")
 
