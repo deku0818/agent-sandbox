@@ -56,7 +56,7 @@ def test_snapshot_response(snapshot_response: SnapshotResponse, snapshot_name: s
 def wait_for_snapshot_ready(sandbox, snapshot_uid: str, max_retries: int = 30, sleep_time: int = 2) -> bool:
     """Helper to poll until a specific snapshot UID is reported as ready."""
     for _ in range(max_retries):
-        check_list = sandbox.snapshots.list()
+        check_list = sandbox.snapshots.list(filter_by={"grouping_labels": {"tenant-id": "test-tenant", "user-id": "test-user"}})
         if check_list.success and any(s.snapshot_uid == snapshot_uid for s in check_list.snapshots):
             print(f"Snapshot '{snapshot_uid}' is ready.")
             return True
@@ -96,10 +96,6 @@ def test_manual_snapshots(client, sandbox, template_name: str, namespace: str) -
     print(
         f"\nChecking if sandbox was restored from latest snapshot '{second_snapshot_uid}'..."
     )
-    restored_sandbox = client.create_sandbox(template_name, namespace=namespace)
-    restore_result = restored_sandbox.is_restored_from_snapshot(second_snapshot_uid)
-    assert restore_result.success, restore_result.error_reason
-    print("Pod was restored from the most recent snapshot.")
 
     return first_snapshot_uid, second_snapshot_uid
 
@@ -128,11 +124,58 @@ def test_suspend_resume(sandbox) -> str:
     return suspend_third_snapshot_uid
 
 
+def test_suspend_resume_new_sandbox(client, template_name: str, namespace: str) -> None:
+    """
+    Tests creating a sandbox, suspending it (generating a snapshot), terminating it, 
+    provisioning a sandbox handle for the same sandbox, and resuming the sandbox from that snapshot.
+    """
+    print("\n======= Testing Suspend and Resume in a NEW Sandbox =======")
+
+    # Create the initial sandbox to take the snapshot from
+    print(f"Creating initial sandbox from template '{template_name}'...")
+    sandbox = client.create_sandbox(template_name, namespace=namespace)
+    print(f"Initial sandbox '{sandbox.sandbox_id}' ready.")
+
+    print(f"\nSuspending current sandbox '{sandbox.sandbox_id}'...")
+    suspend_result = sandbox.suspend(snapshot_before_suspend=True)
+    assert suspend_result.success, f"Suspend failed: {suspend_result.error_reason}"
+    assert sandbox.is_suspended(), "Sandbox should be suspended."
+    suspend_snapshot_uid = suspend_result.snapshot_response.snapshot_uid if suspend_result.snapshot_response else 'None'
+    print(f"Sandbox suspended. Snapshot UID: {suspend_snapshot_uid}")   
+
+    print(f"Waiting for suspend snapshot '{suspend_snapshot_uid}' to become ready...")
+    wait_for_snapshot_ready(sandbox, suspend_snapshot_uid)
+
+    claim_name = sandbox.claim_name
+    print("Closing connection for the old sandbox handle...")
+    sandbox.close_connection()
+
+    print(f"\nRe-attaching to sandbox claim '{claim_name}' to get a fresh handle...")
+    new_sandbox_handle = client.get_sandbox(claim_name, namespace=namespace)
+
+    print(f"\nResuming sandbox '{new_sandbox_handle.sandbox_id}'...")
+    resume_result = new_sandbox_handle.resume()
+    assert resume_result.success, f"Resume failed: {resume_result.error_reason}"
+    assert resume_result.restored_from_snapshot, "Sandbox should have been restored from snapshot."
+    assert not new_sandbox_handle.is_suspended(), "Sandbox should not be suspended after resume."
+    print(f"Sandbox successfully resumed and restored from Snapshot UID: {resume_result.snapshot_uid}")
+
+    # Cleanup snapshots
+    print(f"\nRunning cleanup of remaining snapshots on the restored sandbox '{new_sandbox_handle.sandbox_id}'...")
+    list_result = new_sandbox_handle.snapshots.list()
+    assert list_result.success, list_result.error_reason
+    print(f"Found {len(list_result.snapshots)} snapshots remaining for the sandbox.")
+    
+    delete_result = new_sandbox_handle.snapshots.delete_all(delete_by="all")
+    assert delete_result.success, delete_result.error_reason
+    print("Cleaned up remaining snapshots.")
+
+
 def test_list_and_delete(sandbox, first_snapshot_uid: str, second_snapshot_uid: str, suspend_third_snapshot_uid: str):
     """Tests listing all snapshots and verifying snapshot deletion."""
     print("\n======= Testing List and Delete =======")
     print(f"\nListing all snapshots for sandbox '{sandbox.sandbox_id}'...")
-    list_result = sandbox.snapshots.list()
+    list_result = sandbox.snapshots.list(filter_by={"grouping_labels": {"tenant-id": "test-tenant", "user-id": "test-user"}})
     assert list_result.success, list_result.error_reason
 
     for snap in list_result.snapshots:
@@ -224,6 +267,10 @@ def main(
         test_list_and_delete(
             sandbox, first_snapshot_uid, second_snapshot_uid, suspend_third_snapshot_uid
         )
+
+        # Create a fresh sandbox to test suspend-resume flow on a brand new instance
+        print("\n***** Phase 2: Testing Suspend/Resume on a new Sandbox *****")
+        test_suspend_resume_new_sandbox(client, template_name, namespace)
 
         print("--- Pod Snapshot Test Passed! ---")
 

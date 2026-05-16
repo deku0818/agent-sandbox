@@ -16,10 +16,18 @@
 package metrics
 
 import (
+	"context"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus/testutil"
+	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	"sigs.k8s.io/agent-sandbox/internal/version"
 )
 
 func TestClaimLatencyRecording(t *testing.T) {
@@ -88,4 +96,37 @@ func TestSandboxClaimCreationRecording(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBuildInfo(t *testing.T) {
+	expected := strings.TrimSpace(`
+		# HELP agent_sandbox_build_info Agent sandbox controller build metadata exposed as labels with a constant value of 1.
+		# TYPE agent_sandbox_build_info gauge
+		agent_sandbox_build_info{build_date="`+version.Get().BuildDate+`",compiler="`+version.Get().Compiler+`",git_commit="`+version.Get().GitSHA+`",git_version="`+version.Get().GitVersion+`",go_version="`+version.Get().GoVersion+`",platform="`+version.Get().Platform+`"} 1
+	`) + "\n"
+
+	if err := testutil.CollectAndCompare(BuildInfo, strings.NewReader(expected)); err != nil {
+		t.Errorf("BuildInfo metric mismatch: %v", err)
+	}
+}
+
+func TestStartSpanEndFuncEndsSpan(t *testing.T) {
+	// StartSpan returns an end func; if the caller never invokes it, span.End is never called and
+	// the span is never exported, a span resource leak. This mini test just proves the func closes the span.
+	exp := tracetest.NewInMemoryExporter()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSyncer(exp))
+	t.Cleanup(func() { _ = tp.Shutdown(context.Background()) })
+
+	inst := &otelInstrumenter{
+		tracer:     tp.Tracer("test"),
+		propagator: propagation.TraceContext{},
+		logger:     logr.Discard(),
+	}
+
+	_, end := inst.StartSpan(context.Background(), nil, "op", nil)
+	end()
+
+	spans := exp.GetSpans()
+	require.Len(t, spans, 1)
+	require.False(t, spans[0].EndTime.IsZero(), "end func must call span.End")
 }

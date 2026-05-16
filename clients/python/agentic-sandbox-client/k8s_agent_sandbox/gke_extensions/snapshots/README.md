@@ -70,13 +70,15 @@ This file, located in the parent directory (`clients/python/agentic-sandbox-clie
 
 ### Test Phases:
 
-1.  **Phase 1: Starting Counter Sandbox & Snapshotting**:
-    *   Starts a sandbox with a counter application.
-    *   Takes a snapshot (`test-snapshot-10`) after ~10 seconds.
-    *   Takes a snapshot (`test-snapshot-20`) after ~20 seconds.
-2.  **Phase 2: Restoring from Recent Snapshot**:
-    *   Restores a sandbox from the second snapshot.
-    *   Verifies that the sandbox has been restored from the recent snapshot. 
+1.  **Phase 1: Starting Counter Sandbox, Suspend, Resume & Snapshot Deletion**:
+    - Starts a sandbox with a counter application.
+    - Takes two manual snapshots (`test-snapshot-10` and `test-snapshot-20`).
+    - Suspends and resumes the active sandbox.
+    - Verifies lists of all snapshots, deletes a specific snapshot by UID, and cleans up the rest.
+2.  **Phase 2: Testing Suspend/Resume on a New Sandbox Instance**:
+    - Launches a new sandbox instance and suspends it to take a state snapshot.
+    - Resumes the new sandbox instance, which restores from the sandbox's snapshot.
+    - Cleans up the snapshot from the system.
 
 ### Prerequisites
 
@@ -92,11 +94,34 @@ This file, located in the parent directory (`clients/python/agentic-sandbox-clie
     pip install -e clients/python/agentic-sandbox-client/
     ```
 
-3.  **Pod Snapshot Controller**: The Pod Snapshot controller must be installed in a **GKE standard cluster** running with **gVisor**. 
+3.  **Pod Snapshot Controller**: The Pod Snapshot controller must be installed in a **GKE standard cluster** (version >= 1.35.2-gke.1842000) running with **gVisor**. 
    * For detailed setup instructions, refer to the [GKE Pod Snapshots public documentation](https://docs.cloud.google.com/kubernetes-engine/docs/how-to/pod-snapshots).
    * Ensure a GCS bucket is configured to store the pod snapshot states and that the necessary IAM permissions are applied.
 
-4.  **CRDs**: `PodSnapshotStorageConfig`, `PodSnapshotPolicy` CRDs must be applied. `PodSnapshotPolicy` should specify the selector match labels. (Note: For the test file to work, `maxSnapshotCountPerGroup` in `PodSnapshotPolicy` must be set to 2 or more, and the grouping labels must include `tenant-id` and `user-id`.)
+4.  **CRDs**: `PodSnapshotStorageConfig`, `PodSnapshotPolicy` CRDs must be applied. As a requirement, the label `agents.x-k8s.io/sandbox-name-hash` must be added to the `PodSnapshotPolicy` grouping rules.
+
+    Example `PodSnapshotPolicy`:
+    ```yaml
+    apiVersion: podsnapshot.gke.io/v1
+    kind: PodSnapshotPolicy
+    metadata:
+      name: example-psp-workload
+      namespace: sandbox-test
+    spec:
+      storageConfigName: example-pssc-gcs
+      selector:
+        matchLabels:
+          app: agent-sandbox-workload
+      triggerConfig:
+        type: manual
+        postCheckpoint: resume
+      snapshotGroupingRules:
+        groupByLabelValue:
+          labels: ["agents.x-k8s.io/sandbox-name-hash", "tenant-id", "user-id"]
+          groupRetentionPolicy:
+            maxSnapshotCountPerGroup: 3
+    ```
+    (Note: To run the integration test file successfully, `tenant-id` and `user-id` labels should also be added to the `groupByLabelValue.labels` list in the `PodSnapshotPolicy`.)
 
 5.  **Sandbox Template**: A `SandboxTemplate` (e.g., `python-counter-template`) with runtime gVisor, appropriate KSA and label that matches that selector label in `PodSnapshotPolicy` must be available in the cluster.
 

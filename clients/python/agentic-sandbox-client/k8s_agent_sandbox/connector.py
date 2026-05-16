@@ -16,6 +16,7 @@ import logging
 import socket
 import subprocess
 import time
+from typing import Callable
 import requests
 from abc import ABC, abstractmethod
 from requests.adapters import HTTPAdapter
@@ -24,9 +25,11 @@ from .models import (
     SandboxConnectionConfig,
     SandboxDirectConnectionConfig,
     SandboxGatewayConnectionConfig,
+    SandboxInClusterConnectionConfig,
     SandboxLocalTunnelConnectionConfig,
 )
 from .k8s_helper import K8sHelper
+from .metrics import sandbox_client_discovery_latency_ms
 from .exceptions import (
     SandboxPortForwardError,
     SandboxRequestError,
@@ -53,6 +56,10 @@ class ConnectionStrategy(ABC):
         """Checks if the connection is healthy. Raises SandboxPortForwardError if not."""
         pass
 
+    @abstractmethod
+    def should_inject_router_headers(self) -> bool:
+        """Returns True if X-Sandbox-* router headers should be injected into requests."""
+        pass
 
 class DirectConnectionStrategy(ConnectionStrategy):
     def __init__(self, config: SandboxDirectConnectionConfig):
@@ -67,6 +74,8 @@ class DirectConnectionStrategy(ConnectionStrategy):
     def verify_connection(self):
         pass
 
+    def should_inject_router_headers(self) -> bool:
+        return True
 
 class GatewayConnectionStrategy(ConnectionStrategy):
     def __init__(self, config: SandboxGatewayConnectionConfig, k8s_helper: K8sHelper):
@@ -77,14 +86,23 @@ class GatewayConnectionStrategy(ConnectionStrategy):
     def connect(self) -> str:
         if self.base_url:
             return self.base_url
-
-        ip_address = self.k8s_helper.wait_for_gateway_ip(
-            self.config.gateway_name,
-            self.config.gateway_namespace,
-            self.config.gateway_ready_timeout,
-        )
-        self.base_url = f"http://{ip_address}"
-        return self.base_url
+            
+        start_time = time.monotonic()
+        status = "success"
+        try:
+            ip_address = self.k8s_helper.wait_for_gateway_ip(
+                self.config.gateway_name,
+                self.config.gateway_namespace,
+                self.config.gateway_ready_timeout
+            )
+            self.base_url = f"http://{ip_address}"
+            return self.base_url
+        except Exception:
+            status = "failure"
+            raise
+        finally:
+            latency = (time.monotonic() - start_time) * 1000
+            sandbox_client_discovery_latency_ms.labels(mode="gateway", status=status).observe(latency)
 
     def close(self):
         self.base_url = None
@@ -92,6 +110,8 @@ class GatewayConnectionStrategy(ConnectionStrategy):
     def verify_connection(self):
         pass
 
+    def should_inject_router_headers(self) -> bool:
+        return True
 
 class LocalTunnelConnectionStrategy(ConnectionStrategy):
     def __init__(
@@ -112,6 +132,14 @@ class LocalTunnelConnectionStrategy(ConnectionStrategy):
             s.bind(("127.0.0.1", 0))
             return s.getsockname()[1]
 
+    def _is_port_open(self, port: int) -> bool:
+        """Checks if a port is open on localhost."""
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.1):
+                return True
+        except (socket.timeout, ConnectionRefusedError):
+            return False
+
     def connect(self) -> str:
         if (
             self.base_url
@@ -123,42 +151,48 @@ class LocalTunnelConnectionStrategy(ConnectionStrategy):
         if self.port_forward_process:
             self.close()
 
-        local_port = self._get_free_port()
-
-        logging.info(f"Starting tunnel for Sandbox {self.sandbox_id}")
-        self.port_forward_process = subprocess.Popen(
-            [
-                "kubectl",
-                "port-forward",
-                ROUTER_SERVICE_NAME,
-                f"{local_port}:8080",
-                "-n",
-                self.namespace,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        logging.info("Waiting for port-forwarding to be ready...")
         start_time = time.monotonic()
-        while time.monotonic() - start_time < self.config.port_forward_ready_timeout:
-            if self.port_forward_process.poll() is not None:
-                _, stderr = self.port_forward_process.communicate()
-                raise SandboxPortForwardError(
-                    f"Tunnel crashed: {stderr.decode(errors='replace')}"
-                )
+        status = "success"
+        
+        try:
+            local_port = self._get_free_port()
 
-            try:
-                with socket.create_connection(("127.0.0.1", local_port), timeout=0.1):
+            logging.info(
+                f"Starting tunnel for Sandbox {self.sandbox_id}")
+            
+            self.port_forward_process = subprocess.Popen(
+                [
+                    "kubectl", "port-forward",
+                    ROUTER_SERVICE_NAME,
+                    f"{local_port}:8080",
+                    "-n", self.namespace
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE
+            )
+
+            logging.info("Waiting for port-forwarding to be ready...")
+            while time.monotonic() - start_time < self.config.port_forward_ready_timeout:
+                if self.port_forward_process.poll() is not None:
+                    _, stderr = self.port_forward_process.communicate()
+                    raise SandboxPortForwardError(
+                        f"Tunnel crashed: {stderr.decode(errors='replace')}")
+
+                if self._is_port_open(local_port):
                     self.base_url = f"http://127.0.0.1:{local_port}"
                     logging.info(f"Tunnel ready at {self.base_url}")
-                    time.sleep(0.5)
                     return self.base_url
-            except (socket.timeout, ConnectionRefusedError):
+                
                 time.sleep(0.5)
 
-        self.close()
-        raise TimeoutError("Failed to establish tunnel to Router Service.")
+            self.close()
+            raise TimeoutError("Failed to establish tunnel to Router Service.")
+        except Exception:
+            status = "failure"
+            raise
+        finally:
+            latency = (time.monotonic() - start_time) * 1000
+            sandbox_client_discovery_latency_ms.labels(mode="port_forward", status=status).observe(latency)
 
     def close(self):
         if self.port_forward_process:
@@ -185,6 +219,52 @@ class LocalTunnelConnectionStrategy(ConnectionStrategy):
                 f"Stderr: {stderr.decode(errors='replace')}"
             )
 
+    def should_inject_router_headers(self) -> bool:
+        return True
+
+class InClusterConnectionStrategy(ConnectionStrategy):
+    """Provides direct in-cluster connectivity to a sandbox pod, bypassing the router.
+
+    Requires the SDK to run inside the same Kubernetes cluster as the sandbox.
+    Router-specific request headers are not injected.
+    """
+
+    def __init__(
+        self,
+        sandbox_id: str,
+        namespace: str,
+        config: SandboxInClusterConnectionConfig,
+        get_pod_ip: Callable[[], str | None] | None = None,
+    ):
+        self._dns_url = (
+            f"http://{sandbox_id}.{namespace}"
+            f".svc.cluster.local:{config.server_port}"
+        )
+        self._get_pod_ip = get_pod_ip
+        self._server_port = config.server_port
+        self._resolved = False
+        self._cached_pod_ip_url: str | None = None
+
+    def connect(self) -> str:
+        if self._get_pod_ip:
+            if self._resolved:
+                return self._cached_pod_ip_url or self._dns_url
+            pod_ip = self._get_pod_ip()
+            if pod_ip:
+                self._cached_pod_ip_url = f"http://{pod_ip}:{self._server_port}"
+                self._resolved = True
+                return self._cached_pod_ip_url
+        return self._dns_url
+
+    def verify_connection(self):
+        pass
+
+    def close(self):
+        self._resolved = False
+        self._cached_pod_ip_url = None
+
+    def should_inject_router_headers(self) -> bool:
+        return False
 
 class SandboxConnector:
     """
@@ -197,12 +277,17 @@ class SandboxConnector:
         namespace: str,
         connection_config: SandboxConnectionConfig,
         k8s_helper: K8sHelper,
+        get_pod_ip: Callable[[], str | None] | None = None,
     ):
         # Parameter initialization
         self.id = sandbox_id
         self.namespace = namespace
         self.connection_config = connection_config
         self.k8s_helper = k8s_helper
+        self._get_pod_ip = get_pod_ip
+        self._pod_ip: str | None = None
+        self._pod_ip_resolved = False
+        self._pod_ip_auth_failed = False
 
         # Connection strategy initialization
         self.strategy = self._connection_strategy()
@@ -233,9 +318,9 @@ class SandboxConnector:
         elif isinstance(self.connection_config, SandboxGatewayConnectionConfig):
             return GatewayConnectionStrategy(self.connection_config, self.k8s_helper)
         elif isinstance(self.connection_config, SandboxLocalTunnelConnectionConfig):
-            return LocalTunnelConnectionStrategy(
-                self.id, self.namespace, self.connection_config
-            )
+            return LocalTunnelConnectionStrategy(self.id, self.namespace, self.connection_config)
+        elif isinstance(self.connection_config, SandboxInClusterConnectionConfig):
+            return InClusterConnectionStrategy(self.id, self.namespace, self.connection_config, self._get_pod_ip)
         else:
             raise ValueError("Unknown connection configuration type")
 
@@ -246,6 +331,8 @@ class SandboxConnector:
         return self.strategy.connect()
 
     def close(self):
+        self._pod_ip_resolved = False
+        self._pod_ip = None
         self.strategy.close()
         if self.session:
             self.session.close()
@@ -262,9 +349,26 @@ class SandboxConnector:
             url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}"
 
             headers = kwargs.get("headers", {}).copy()
-            headers["X-Sandbox-ID"] = self.id
-            headers["X-Sandbox-Namespace"] = self.namespace
-            headers["X-Sandbox-Port"] = str(self.connection_config.server_port)
+            if self.strategy.should_inject_router_headers():
+                headers["X-Sandbox-ID"] = self.id
+                headers["X-Sandbox-Namespace"] = self.namespace
+                headers["X-Sandbox-Port"] = str(self.connection_config.server_port)
+                if self._get_pod_ip and not self._pod_ip_auth_failed:
+                    if not self._pod_ip_resolved:
+                        try:
+                            pod_ip = self._get_pod_ip()
+                            if pod_ip:
+                                self._pod_ip = pod_ip
+                                self._pod_ip_resolved = True
+                        except Exception as e:
+                            status_code = getattr(getattr(e, "response", None), "status_code", None)
+                            if status_code in (401, 403):
+                                self._pod_ip_auth_failed = True
+                                logging.debug(f"K8s API auth failed ({status_code}). Permanently disabling direct pod IP routing for this client instance.")
+                            else:
+                                logging.debug(f"Transient failure resolving pod IP for direct routing: {e}")
+                    if self._pod_ip:
+                        headers["X-Sandbox-Pod-IP"] = self._pod_ip
             kwargs["headers"] = headers
 
             # Send the request
@@ -279,6 +383,8 @@ class SandboxConnector:
             status_code = resp.status_code if resp is not None else None
 
             logging.error(f"Request to sandbox failed: {e}")
+            self._pod_ip_resolved = False
+            self._pod_ip = None
             self.close()
             raise SandboxRequestError(
                 f"Failed to communicate with the sandbox at {url}.",

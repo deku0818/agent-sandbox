@@ -25,10 +25,32 @@ type ConditionType string
 func (c ConditionType) String() string { return string(c) }
 
 const (
-	// SandboxConditionReady indicates readiness for Sandbox
-	SandboxConditionReady ConditionType = "Ready"
+	// SandboxConditionSuspended indicates the sandbox is administratively suspended.
+	SandboxConditionSuspended ConditionType = "Suspended"
+	// SandboxReasonSuspendedPodTerminated indicates that the pod has been terminated.
+	SandboxReasonSuspendedPodTerminated = "PodTerminated"
+	// SandboxReasonSuspendedPodNotTerminated indicates the pod has not been terminated yet.
+	SandboxReasonSuspendedPodNotTerminated = "PodNotTerminated"
 
-	// SandboxReasonExpired indicates expired state for Sandbox
+	// SandboxConditionReady indicates readiness for Sandbox.
+	SandboxConditionReady ConditionType = "Ready"
+	// SandboxReasonDependenciesReady indicates the sandbox is fully operational.
+	SandboxReasonDependenciesReady = "DependenciesReady"
+	// SandboxReasonDependenciesNotReady indicates the Sandbox is expected to be running
+	// but its underlying dependencies are not fully provisioned or ready yet.
+	SandboxReasonDependenciesNotReady = "DependenciesNotReady"
+	// SandboxReasonSuspended indicates the Sandbox has been administratively suspended
+	// (i.e., intentional action by the user to suspend the Sandbox).
+	SandboxReasonSuspended = "SandboxSuspended"
+
+	// SandboxConditionFinished indicates the backing Pod reached a terminal phase.
+	SandboxConditionFinished ConditionType = "Finished"
+	// SandboxReasonPodSucceeded indicates the backing Pod completed successfully.
+	SandboxReasonPodSucceeded = "PodSucceeded"
+	// SandboxReasonPodFailed indicates the backing Pod completed unsuccessfully.
+	SandboxReasonPodFailed = "PodFailed"
+
+	// SandboxReasonExpired indicates expired state for Sandbox.
 	SandboxReasonExpired = "SandboxExpired"
 
 	// SandboxPodNameAnnotation is the annotation used to track the pod name adopted from a warm pool.
@@ -49,14 +71,14 @@ type PodMetadata struct {
 	// and services.
 	// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels
 	// +optional
-	Labels map[string]string `json:"labels,omitempty" protobuf:"bytes,1,rep,name=labels"`
+	Labels map[string]string `json:"labels,omitempty"`
 
 	// annotations is an unstructured key value map stored with a resource that may be
 	// set by external tools to store and retrieve arbitrary metadata. They are not
 	// queryable and should be preserved when modifying objects.
 	// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations
 	// +optional
-	Annotations map[string]string `json:"annotations,omitempty" protobuf:"bytes,2,rep,name=annotations"`
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 type EmbeddedObjectMetadata struct {
@@ -67,56 +89,57 @@ type EmbeddedObjectMetadata struct {
 	// Cannot be updated.
 	// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names#names
 	// +optional
-	Name string `json:"name,omitempty" protobuf:"bytes,1,opt,name=name"`
+	Name string `json:"name,omitempty"`
 
 	// labels defines the map of string keys and values that can be used to organize and categorize
 	// (scope and select) objects. May match selectors of replication controllers
 	// and services.
 	// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels
 	// +optional
-	Labels map[string]string `json:"labels,omitempty" protobuf:"bytes,1,rep,name=labels"`
+	Labels map[string]string `json:"labels,omitempty"`
 
 	// annotations is an unstructured key value map stored with a resource that may be
 	// set by external tools to store and retrieve arbitrary metadata. They are not
 	// queryable and should be preserved when modifying objects.
 	// More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations
 	// +optional
-	Annotations map[string]string `json:"annotations,omitempty" protobuf:"bytes,2,rep,name=annotations"`
+	Annotations map[string]string `json:"annotations,omitempty"`
 }
 
 type PodTemplate struct {
 	// spec is the Pod's spec
 	// +required
-	Spec corev1.PodSpec `json:"spec" protobuf:"bytes,3,opt,name=spec"`
+	Spec corev1.PodSpec `json:"spec"`
 
 	// metadata is the Pod's metadata. Only labels and annotations are used.
 	// +optional
-	ObjectMeta PodMetadata `json:"metadata" protobuf:"bytes,3,opt,name=metadata"`
+	ObjectMeta PodMetadata `json:"metadata"`
 }
 
 type PersistentVolumeClaimTemplate struct {
 	// metadata is the PVC's metadata.
 	// +optional
-	EmbeddedObjectMetadata `json:"metadata" protobuf:"bytes,3,opt,name=metadata"`
+	EmbeddedObjectMetadata `json:"metadata"`
 
 	// spec is the PVC's spec
 	// +required
-	Spec corev1.PersistentVolumeClaimSpec `json:"spec" protobuf:"bytes,3,opt,name=spec"`
+	Spec corev1.PersistentVolumeClaimSpec `json:"spec"`
 }
 
-// SandboxSpec defines the desired state of Sandbox
+// SandboxSpec defines the desired state of Sandbox.
 type SandboxSpec struct {
 	// The following markers will use OpenAPI v3 schema to validate the value
 	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
 
 	// podTemplate describes the pod spec that will be used to create an agent sandbox.
 	// +required
-	PodTemplate PodTemplate `json:"podTemplate" protobuf:"bytes,3,opt,name=podTemplate"`
+	PodTemplate PodTemplate `json:"podTemplate"`
 
 	// volumeClaimTemplates is a list of claims that the sandbox pod is allowed to reference.
 	// Every claim in this list must have at least one matching access mode with a provisioner volume.
 	// +optional
-	VolumeClaimTemplates []PersistentVolumeClaimTemplate `json:"volumeClaimTemplates,omitempty" protobuf:"bytes,4,rep,name=volumeClaimTemplates"`
+	// +listType=atomic
+	VolumeClaimTemplates []PersistentVolumeClaimTemplate `json:"volumeClaimTemplates,omitempty"`
 
 	// Lifecycle defines when and how the sandbox should be shut down.
 	// +optional
@@ -130,6 +153,16 @@ type SandboxSpec struct {
 	// +kubebuilder:default=1
 	// +optional
 	Replicas *int32 `json:"replicas,omitempty"`
+
+	// service controls whether the controller should automatically create a
+	// headless Service for this Sandbox.
+	// When unset, the controller preserves existing Services for backward
+	// compatibility but does not create new ones. Set to true to enable or false
+	// to explicitly disable and remove the Service.
+	//nolint:kubeapilinter
+	//nolint:nobools // Enum not used to avoid duplicating the Service API; field is not expected to extend (issue #746).
+	// +optional
+	Service *bool `json:"service,omitempty"`
 }
 
 // ShutdownPolicy describes the policy for deleting the Sandbox when it expires.
@@ -193,7 +226,7 @@ type SandboxStatus struct {
 // +kubebuilder:subresource:status
 // +kubebuilder:subresource:scale:specpath=.spec.replicas,statuspath=.status.replicas,selectorpath=.status.selector
 // +kubebuilder:resource:scope=Namespaced,shortName=sandbox
-// Sandbox is the Schema for the sandboxes API
+// Sandbox is the Schema for the sandboxes API.
 type Sandbox struct {
 	metav1.TypeMeta `json:",inline"`
 
@@ -212,7 +245,7 @@ type Sandbox struct {
 
 // +kubebuilder:object:root=true
 
-// SandboxList contains a list of Sandbox
+// SandboxList contains a list of Sandbox.
 type SandboxList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`

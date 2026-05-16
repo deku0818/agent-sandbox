@@ -25,7 +25,8 @@ from k8s_agent_sandbox.gke_extensions.snapshots.sandbox_with_snapshot_support im
     ResumeResponse,
 )
 from k8s_agent_sandbox.constants import (
-    PODSNAPSHOT_POD_NAME_LABEL,
+    SANDBOX_NAME_HASH_LABEL,
+    PODSNAPSHOT_POD_NAME_ANNOTATION,
     PODSNAPSHOT_API_GROUP,
     PODSNAPSHOT_API_VERSION,
     PODSNAPSHOTMANUALTRIGGER_PLURAL,
@@ -55,6 +56,9 @@ class TestSandboxWithSnapshotSupport(unittest.TestCase):
         mock_ctm.return_value = (None, None)
 
         self.mock_k8s_helper = MagicMock()
+        self.mock_k8s_helper.get_sandbox.return_value = {
+            "status": {"selector": f"{SANDBOX_NAME_HASH_LABEL}=test-hash"}
+        }
 
         # Create SandboxWithSnapshotSupport
         self.sandbox = SandboxWithSnapshotSupport(
@@ -67,6 +71,8 @@ class TestSandboxWithSnapshotSupport(unittest.TestCase):
         # Access the underlying engine
         self.engine = self.sandbox.snapshots
         self.engine.get_pod_name_func = self.sandbox.get_pod_name
+        
+        self.engine.get_sandbox_name_hash_func = MagicMock(return_value="test-hash")
 
     def tearDown(self):
         logging.info(f"Finished {self._testMethodName}.")
@@ -458,7 +464,8 @@ class TestSandboxWithSnapshotSupport(unittest.TestCase):
                         "name": "snap-1",
                         "uid": "uid-1",
                         "creationTimestamp": "2023-01-02T00:00:00Z",
-                        "labels": {PODSNAPSHOT_POD_NAME_LABEL: "test-pod"},
+                        "labels": {SANDBOX_NAME_HASH_LABEL: "test-hash"},
+                        "annotations": {PODSNAPSHOT_POD_NAME_ANNOTATION: "test-pod"},
                     },
                     "status": {"conditions": [{"type": "Ready", "status": "True"}]},
                 },
@@ -467,7 +474,8 @@ class TestSandboxWithSnapshotSupport(unittest.TestCase):
                         "name": "snap-2",
                         "uid": "uid-2",
                         "creationTimestamp": "2023-01-01T00:00:00Z",
-                        "labels": {PODSNAPSHOT_POD_NAME_LABEL: "test-pod"},
+                        "labels": {SANDBOX_NAME_HASH_LABEL: "test-hash"},
+                        "annotations": {PODSNAPSHOT_POD_NAME_ANNOTATION: "test-pod"},
                     },
                     "status": {"conditions": [{"type": "Ready", "status": "True"}]},
                 },
@@ -493,13 +501,15 @@ class TestSandboxWithSnapshotSupport(unittest.TestCase):
         self.assertEqual(len(result.snapshots), 2)
         # Verify it sorted by creationTimestamp newest first
         self.assertEqual(result.snapshots[0].snapshot_uid, "snap-1")
+        self.assertEqual(result.snapshots[0].source_pod, "test-pod")
         self.assertEqual(result.snapshots[1].snapshot_uid, "snap-2")
+        self.assertEqual(result.snapshots[1].source_pod, "test-pod")
         self.mock_k8s_helper.custom_objects_api.list_namespaced_custom_object.assert_called_once_with(
             group=PODSNAPSHOT_API_GROUP,
             version=PODSNAPSHOT_API_VERSION,
             namespace="test-ns",
             plural=PODSNAPSHOT_PLURAL,
-            label_selector=f"{PODSNAPSHOT_POD_NAME_LABEL}=test-pod,test-label=test-value",
+            label_selector=f"{SANDBOX_NAME_HASH_LABEL}=test-hash,test-label=test-value",
         )
 
     def test_snapshots_list_filter_empty(self):
@@ -576,7 +586,8 @@ class TestSandboxWithSnapshotSupport(unittest.TestCase):
                         "name": "snap-1",
                         "uid": "uid-1",
                         "creationTimestamp": None,  # Test Case: None
-                        "labels": {PODSNAPSHOT_POD_NAME_LABEL: "test-pod"},
+                        "labels": {SANDBOX_NAME_HASH_LABEL: "test-hash"},
+                        "annotations": {PODSNAPSHOT_POD_NAME_ANNOTATION: "test-pod"},
                     },
                     "status": {"conditions": [{"type": "Ready", "status": "True"}]},
                 },
@@ -585,7 +596,8 @@ class TestSandboxWithSnapshotSupport(unittest.TestCase):
                         "name": "snap-2",
                         "uid": "uid-2",
                         "creationTimestamp": "2023-01-01T00:00:00Z",
-                        "labels": {PODSNAPSHOT_POD_NAME_LABEL: "test-pod"},
+                        "labels": {SANDBOX_NAME_HASH_LABEL: "test-hash"},
+                        "annotations": {PODSNAPSHOT_POD_NAME_ANNOTATION: "test-pod"},
                     },
                     "status": {"conditions": [{"type": "Ready", "status": "True"}]},
                 },
@@ -616,7 +628,7 @@ class TestSandboxWithSnapshotSupport(unittest.TestCase):
             version=PODSNAPSHOT_API_VERSION,
             namespace="test-ns",
             plural=PODSNAPSHOT_PLURAL,
-            label_selector=f"{PODSNAPSHOT_POD_NAME_LABEL}=test-pod",
+            label_selector=f"{SANDBOX_NAME_HASH_LABEL}=test-hash",
         )
 
     def test_snapshots_list_no_pod_name(self):
@@ -626,6 +638,14 @@ class TestSandboxWithSnapshotSupport(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertEqual(result.error_code, ERROR_CODE)
         self.assertIn("Pod name not found", result.error_reason)
+
+    def test_snapshots_list_no_sandbox_name_hash(self):
+        """Test list snapshots fails when sandbox name hash is missing."""
+        self.engine.get_sandbox_name_hash_func.return_value = None
+        result = self.engine.list()
+        self.assertFalse(result.success)
+        self.assertEqual(result.error_code, ERROR_CODE)
+        self.assertIn("Sandbox name hash not found", result.error_reason)
 
     def test_snapshots_list_api_exception(self):
         self.mock_k8s_helper.custom_objects_api.list_namespaced_custom_object.side_effect = ApiException(
@@ -1125,6 +1145,18 @@ class TestSandboxWithSnapshotSupport(unittest.TestCase):
             self.assertFalse(result.success)
             self.assertIn("Timed out", result.error_reason)
 
+    @patch.object(SandboxWithSnapshotSupport, 'is_suspended', return_value=False)
+    def test_suspend_missing_name_hash(self, mock_is_suspended):
+        """Test suspend fails gracefully when sandbox name hash is missing/not found."""
+        self.sandbox._sandbox_name_hash = None
+        self.mock_k8s_helper.get_sandbox.return_value = {} # No selector info in status
+        
+        result = self.sandbox.suspend(snapshot_before_suspend=False)
+        
+        self.assertFalse(result.success)
+        self.assertIn("Failed to resolve sandbox name hash", result.error_reason)
+        self.mock_k8s_helper.custom_objects_api.patch_namespaced_custom_object.assert_not_called()
+
 
     def test_is_suspended_true(self):
         self.mock_k8s_helper.custom_objects_api.get_namespaced_custom_object.return_value = {
@@ -1139,6 +1171,35 @@ class TestSandboxWithSnapshotSupport(unittest.TestCase):
             "status": {"podIPs": ["10.0.0.1"]}
         }
         self.assertFalse(self.sandbox.is_suspended())
+
+    def test_get_sandbox_name_hash_success(self):
+        """Test get_sandbox_name_hash reads from status.selector and caches it."""
+        # Reset mock from calls made during eager fetch in Sandbox __init__
+        self.mock_k8s_helper.get_sandbox.reset_mock()
+        self.sandbox._sandbox_name_hash = None
+        
+        self.mock_k8s_helper.get_sandbox.return_value = {
+            "status": {"selector": f"{SANDBOX_NAME_HASH_LABEL}=test-hash-value"}
+        }
+        
+        # First call should fetch from K8s
+        res1 = self.sandbox.get_sandbox_name_hash()
+        self.assertEqual(res1, "test-hash-value")
+        self.mock_k8s_helper.get_sandbox.assert_called_once_with("test-id", "test-ns")
+        
+        # Second call should use cache
+        self.mock_k8s_helper.get_sandbox.reset_mock()
+        res2 = self.sandbox.get_sandbox_name_hash()
+        self.assertEqual(res2, "test-hash-value")
+        self.mock_k8s_helper.get_sandbox.assert_not_called()
+
+    def test_get_sandbox_name_hash_not_found(self):
+        """Test get_sandbox_name_hash returns None when not found."""
+        self.sandbox._sandbox_name_hash = None
+        self.mock_k8s_helper.get_sandbox.return_value = {}
+        
+        res = self.sandbox.get_sandbox_name_hash()
+        self.assertIsNone(res)
 
 if __name__ == "__main__":
     unittest.main()

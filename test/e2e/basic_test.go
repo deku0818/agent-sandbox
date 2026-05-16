@@ -23,7 +23,6 @@ import (
 	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/utils/ptr"
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
 	"sigs.k8s.io/agent-sandbox/test/e2e/framework"
 	"sigs.k8s.io/agent-sandbox/test/e2e/framework/predicates"
@@ -45,6 +44,7 @@ func simpleSandbox(ns string) *sandboxv1alpha1.Sandbox {
 	sandboxObj := &sandboxv1alpha1.Sandbox{}
 	sandboxObj.Name = "my-sandbox"
 	sandboxObj.Namespace = ns
+	sandboxObj.Spec.Service = new(true)
 	sandboxObj.Spec.PodTemplate = sandboxv1alpha1.PodTemplate{
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
@@ -83,11 +83,11 @@ func TestSimpleSandbox(t *testing.T) {
 			LabelSelector: "agents.x-k8s.io/sandbox-name-hash=" + nameHash,
 			Conditions: []metav1.Condition{
 				{
-					Message:            "Pod is Ready; Service Exists",
-					ObservedGeneration: 1,
-					Reason:             "DependenciesReady",
-					Status:             "True",
 					Type:               "Ready",
+					Status:             metav1.ConditionTrue,
+					ObservedGeneration: 1,
+					Reason:             sandboxv1alpha1.SandboxReasonDependenciesReady,
+					Message:            "Pod is Ready; Service Exists",
 				},
 			},
 		}),
@@ -100,8 +100,8 @@ func TestSimpleSandbox(t *testing.T) {
 		predicates.HasOwnerReferences([]metav1.OwnerReference{
 			{
 				APIVersion:         "agents.x-k8s.io/v1alpha1",
-				BlockOwnerDeletion: ptr.To(true),
-				Controller:         ptr.To(true),
+				BlockOwnerDeletion: new(true),
+				Controller:         new(true),
 				Kind:               "Sandbox",
 				Name:               "my-sandbox",
 				UID:                sandboxObj.UID,
@@ -117,8 +117,8 @@ func TestSimpleSandbox(t *testing.T) {
 		predicates.HasOwnerReferences([]metav1.OwnerReference{
 			{
 				APIVersion:         "agents.x-k8s.io/v1alpha1",
-				BlockOwnerDeletion: ptr.To(true),
-				Controller:         ptr.To(true),
+				BlockOwnerDeletion: new(true),
+				Controller:         new(true),
 				Kind:               "Sandbox",
 				Name:               "my-sandbox",
 				UID:                sandboxObj.UID,

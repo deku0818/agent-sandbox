@@ -31,12 +31,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
-	sandboxcontrollers "sigs.k8s.io/agent-sandbox/controllers"
 	extensionsv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 	asmetrics "sigs.k8s.io/agent-sandbox/internal/metrics"
 )
 
-// SandboxTemplateReconciler reconciles a SandboxTemplate object
+// SandboxTemplateReconciler reconciles a SandboxTemplate object.
 type SandboxTemplateReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
@@ -45,8 +44,10 @@ type SandboxTemplateReconciler struct {
 }
 
 //+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxtemplates,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxtemplates/status,verbs=get;update;patch
+//+kubebuilder:rbac:groups=extensions.agents.x-k8s.io,resources=sandboxtemplates/finalizers,verbs=get;update;patch
 //+kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
+//+kubebuilder:rbac:groups=core,resources=events,verbs=create;patch;update
+//+kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch;update
 
 func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx)
@@ -98,7 +99,7 @@ func (r *SandboxTemplateReconciler) Reconcile(ctx context.Context, req ctrl.Requ
 		desiredSpec = networkingv1.NetworkPolicySpec{
 			PodSelector: metav1.LabelSelector{
 				MatchLabels: map[string]string{
-					sandboxTemplateRefHash: sandboxcontrollers.NameHash(template.Name),
+					sandboxTemplateRefHash: SandboxTemplateRefHash(template.Name),
 				},
 			},
 			PolicyTypes: []networkingv1.PolicyType{
@@ -157,7 +158,7 @@ func buildDefaultNetworkPolicySpec(templateName string) networkingv1.NetworkPoli
 	return networkingv1.NetworkPolicySpec{
 		PodSelector: metav1.LabelSelector{
 			MatchLabels: map[string]string{
-				sandboxTemplateRefHash: sandboxcontrollers.NameHash(templateName),
+				sandboxTemplateRefHash: SandboxTemplateRefHash(templateName),
 			},
 		},
 		PolicyTypes: []networkingv1.PolicyType{

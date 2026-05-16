@@ -25,6 +25,9 @@ import (
 const (
 	// ClaimExpiredReason is the reason used in conditions/events when a claim expires.
 	ClaimExpiredReason = "ClaimExpired"
+
+	// AssignedSandboxNameLabel is the label key applied to the claim to identify the adopted Sandbox name.
+	AssignedSandboxNameLabel = "agents.x-k8s.io/sandbox-name"
 )
 
 // WarmPoolPolicy describes the policy for using warm pools.
@@ -83,24 +86,46 @@ type Lifecycle struct {
 	// +optional
 	ShutdownTime *metav1.Time `json:"shutdownTime,omitempty"`
 
+	// ttlSecondsAfterFinished limits how long a finished claim is retained.
+	// The timer starts from the mirrored Finished condition's LastTransitionTime.
+	// +kubebuilder:validation:Minimum=0
+	// +optional
+	TTLSecondsAfterFinished *int32 `json:"ttlSecondsAfterFinished,omitempty"`
+
 	// shutdownPolicy determines the behavior when the SandboxClaim expires.
 	// +kubebuilder:default=Retain
 	// +optional
 	ShutdownPolicy ShutdownPolicy `json:"shutdownPolicy,omitempty"`
 }
 
-// SandboxTemplateRef references a SandboxTemplate
+// SandboxTemplateRef references a SandboxTemplate.
 type SandboxTemplateRef struct {
 	// name of the SandboxTemplate
 	// +required
-	Name string `json:"name,omitempty" protobuf:"bytes,1,name=name"`
+	Name string `json:"name,omitempty"`
 }
 
-// SandboxClaimSpec defines the desired state of Sandbox
+// EnvVar represents a custom environment variable key-value pair.
+type EnvVar struct {
+	// name of the environment variable.
+	// +required
+	Name string `json:"name"`
+
+	// value of the environment variable.
+	// +required
+	Value string `json:"value"`
+
+	// containerName specifies the target container for the environment variable.
+	// If not specified, it defaults to the first container defined in the template.
+	// +optional
+	ContainerName string `json:"containerName,omitempty"`
+}
+
+// SandboxClaimSpec defines the desired state of Sandbox.
 type SandboxClaimSpec struct {
 	// sandboxTemplateRef defines the name of the SandboxTemplate to be used for creating a Sandbox.
 	// +required
-	TemplateRef SandboxTemplateRef `json:"sandboxTemplateRef,omitempty" protobuf:"bytes,3,name=sandboxTemplateRef"`
+	TemplateRef SandboxTemplateRef `json:"sandboxTemplateRef,omitempty"`
 
 	// lifecycle defines when and how the SandboxClaim should be shut down.
 	// +optional
@@ -118,17 +143,22 @@ type SandboxClaimSpec struct {
 	// Label values are limited to 63 characters and must match Kubernetes label value patterns.
 	// +optional
 	AdditionalPodMetadata sandboxv1alpha1.PodMetadata `json:"additionalPodMetadata,omitempty"`
+
+	// env is a list of environment variables to inject into the sandbox
+	// +listType=atomic
+	// +optional
+	Env []EnvVar `json:"env,omitempty"`
 }
 
 // SandboxClaimStatus defines the observed state of Sandbox.
 type SandboxClaimStatus struct {
 	// conditions represent the latest available observations of a Sandbox's current state.
 	// +optional
-	Conditions []metav1.Condition `json:"conditions,omitempty" protobuf:"bytes,1,rep,name=conditions"`
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
 
 	// sandbox defines the state of Sandbox
 	// +optional
-	SandboxStatus SandboxStatus `json:"sandbox,omitempty" protobuf:"bytes,2,opt,name=sandboxStatus"`
+	SandboxStatus SandboxStatus `json:"sandbox,omitempty"`
 }
 
 type SandboxStatus struct {
@@ -146,7 +176,7 @@ type SandboxStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Namespaced,shortName=sandboxclaim
-// SandboxClaim is the Schema for the sandbox Claim API
+// SandboxClaim is the Schema for the sandbox Claim API.
 type SandboxClaim struct {
 	metav1.TypeMeta `json:",inline"`
 
@@ -165,7 +195,7 @@ type SandboxClaim struct {
 
 // +kubebuilder:object:root=true
 
-// SandboxList contains a list of Sandbox
+// SandboxList contains a list of Sandbox.
 type SandboxClaimList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitempty"`

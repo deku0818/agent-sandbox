@@ -52,6 +52,7 @@ class SandboxWithSnapshotSupport(Sandbox):
             namespace=self.namespace,
             k8s_helper=self.k8s_helper,
             get_pod_name_func=self.get_pod_name,
+            get_sandbox_name_hash_func=self.get_sandbox_name_hash,
         )
 
     @property
@@ -158,6 +159,20 @@ class SandboxWithSnapshotSupport(Sandbox):
                 snapshot_response=None,
                 error_reason="",
                 error_code=SUCCESS_CODE
+            )
+
+        # Ensure the sandbox name hash is fetched and cached before we scale down to 0 replicas.
+        try:
+            sandbox_name_hash = self.get_sandbox_name_hash()
+            if not sandbox_name_hash:
+                raise ValueError(f"Sandbox name hash resolved to empty or None: {sandbox_name_hash}")
+        except Exception as e:
+            logger.error(f"Cannot suspend Sandbox: failed to retrieve required name hash label: {e}")
+            return SuspendResponse(
+                success=False,
+                snapshot_response=None,
+                error_reason=f"Failed to resolve sandbox name hash: {e}",
+                error_code=ERROR_CODE
             )
 
         snapshot_response = None
