@@ -20,6 +20,7 @@ created on first use and persists until explicitly destroyed.
 """
 
 import logging
+import os
 import sys
 import time
 
@@ -30,14 +31,25 @@ from .k8s_helper import K8sHelper
 from .models import (
     ExecutionResult,
     SandboxConnectionConfig,
+    SandboxInClusterConnectionConfig,
     SandboxLocalTunnelConnectionConfig,
 )
+from .utils import construct_sandbox_claim_lifecycle_spec
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     stream=sys.stdout,
 )
+
+
+def _default_connection_config() -> SandboxConnectionConfig:
+    # 集群内（KUBERNETES_SERVICE_HOST 存在）→ in-cluster DNS 直连,绕开 router 和
+    # kubectl port-forward 子进程,延迟和资源占用都更优;集群外保留 port-forward
+    # 兜底,保持本地开发体验不变。
+    if os.environ.get("KUBERNETES_SERVICE_HOST"):
+        return SandboxInClusterConnectionConfig()
+    return SandboxLocalTunnelConnectionConfig()
 
 
 class OmniAgentSandboxClient:
@@ -56,13 +68,19 @@ class OmniAgentSandboxClient:
         namespace: str = "default",
         connection_config: SandboxConnectionConfig | None = None,
         sandbox_ready_timeout: int = 180,
+        shutdown_after_seconds: int | None = None,
+        idle_timeout_seconds: int | None = None,
     ):
         self.template_name = template_name
         self.namespace = namespace
-        self.connection_config = (
-            connection_config or SandboxLocalTunnelConnectionConfig()
-        )
+        self.connection_config = connection_config or _default_connection_config()
         self.sandbox_ready_timeout = sandbox_ready_timeout
+        # TTL 兜底,两种模式互斥语义:
+        # - shutdown_after_seconds: hard deadline,sandbox 创建后 N 秒整死,不续。
+        # - idle_timeout_seconds:    idle TTL(类 E2B),每次 run/write/read 调用
+        #   都把 deadline 推到 now+N。同时传两个时 idle 接管(初始与续期都用它)。
+        self.shutdown_after_seconds = shutdown_after_seconds
+        self.idle_timeout_seconds = idle_timeout_seconds
 
         self.k8s_helper = K8sHelper()
 
@@ -84,6 +102,7 @@ class OmniAgentSandboxClient:
         container's environ before launching the subprocess (user values win).
         """
         connector = self._ensure_sandbox(session_id)
+        self._renew(session_id)
         payload: dict[str, object] = {"command": command, "timeout": timeout}
         if env:
             payload["env"] = env
@@ -98,6 +117,7 @@ class OmniAgentSandboxClient:
     def write(self, session_id: str, path: str, content: bytes | str) -> None:
         """Upload a file to the sandbox."""
         connector = self._ensure_sandbox(session_id)
+        self._renew(session_id)
         if isinstance(content, str):
             content = content.encode("utf-8")
         connector.send_request("POST", "upload", files={"file": (path, content)})
@@ -105,8 +125,24 @@ class OmniAgentSandboxClient:
     def read(self, session_id: str, path: str) -> bytes:
         """Download a file from the sandbox."""
         connector = self._ensure_sandbox(session_id)
+        self._renew(session_id)
         response = connector.send_request("GET", f"download/{path}")
         return response.content
+
+    def _renew(self, session_id: str) -> None:
+        # idle TTL 模式下,每次活跃调用把 SandboxClaim.spec.lifecycle.shutdownTime
+        # 推到 now+idle_timeout_seconds,让 controller 顺延 Delete。失败不抛——若
+        # K8s 短暂不可达,下次调用会再续;若 sandbox 已被 controller 删,本次请求
+        # 也会收到 connection error,调用方按正常错误处理重建即可。
+        if self.idle_timeout_seconds is None:
+            return
+        lifecycle = construct_sandbox_claim_lifecycle_spec(self.idle_timeout_seconds)
+        try:
+            self.k8s_helper.patch_sandbox_claim_lifecycle(
+                session_id, self.namespace, lifecycle
+            )
+        except Exception as e:
+            logging.warning(f"Failed to renew TTL for {session_id}: {e}")
 
     def destroy(self, session_id: str) -> None:
         """Destroy the sandbox for the given session."""
@@ -119,10 +155,21 @@ class OmniAgentSandboxClient:
         if session_id in self._connectors:
             return self._connectors[session_id]
 
-        # Create claim if it doesn't already exist
+        # Create claim if it doesn't already exist。初始 lifecycle:idle 模式优先
+        # (避免创建后到第一次 _renew 之间出现空窗),否则用 hard deadline;两者都没
+        # 设就不带 lifecycle,沿用 SandboxClaim 默认行为。
+        initial_ttl = self.idle_timeout_seconds or self.shutdown_after_seconds
+        lifecycle = (
+            construct_sandbox_claim_lifecycle_spec(initial_ttl)
+            if initial_ttl is not None
+            else None
+        )
         try:
             self.k8s_helper.create_sandbox_claim(
-                session_id, self.template_name, self.namespace
+                session_id,
+                self.template_name,
+                self.namespace,
+                lifecycle=lifecycle,
             )
         except k8s_client.ApiException as e:
             if e.status != 409:
@@ -142,11 +189,19 @@ class OmniAgentSandboxClient:
             sandbox_id, self.namespace, remaining_timeout
         )
 
+        # get_pod_ip 只有 InClusterConnectionStrategy(use_pod_ip=True)会调用。
+        # 闭包绑定 sandbox_id 保证多 session 互不串。
+        def get_pod_ip() -> str | None:
+            obj = self.k8s_helper.get_sandbox(sandbox_id, self.namespace) or {}
+            pod_ips = (obj.get("status") or {}).get("podIPs") or []
+            return pod_ips[0] if pod_ips else None
+
         connector = SandboxConnector(
             sandbox_id=sandbox_id,
             namespace=self.namespace,
             connection_config=self.connection_config,
             k8s_helper=self.k8s_helper,
+            get_pod_ip=get_pod_ip,
         )
         self._connectors[session_id] = connector
         return connector

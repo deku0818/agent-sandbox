@@ -21,6 +21,7 @@ import logging
 import os
 import shlex
 import sys
+import time
 import urllib.parse
 
 from fastapi import FastAPI, File, UploadFile
@@ -88,7 +89,12 @@ app = FastAPI(title="OmniAgent Sandbox Runtime")
 
 
 @app.get("/")
+@app.get("/healthz")
+@app.get("/readyz")
 async def health():
+    # /healthz 和 /readyz 是 K8s probe 惯用路径,/ 保留向后兼容;三者当前行为
+    # 一致——server 进程起来就可以接请求,未来要分离 liveness/readiness
+    # (例如 readyz 检查依赖 daemon)再拆。
     return {"status": "ok"}
 
 
@@ -96,6 +102,7 @@ async def health():
 async def execute(req: ExecuteRequest):
     global _cwd
 
+    started = time.monotonic()
     wrapped = (
         f"cd {shlex.quote(_cwd)} 2>/dev/null\n"
         f"{req.command}\n"
@@ -129,7 +136,14 @@ async def execute(req: ExecuteRequest):
     except asyncio.TimeoutError:
         proc.kill()
         await proc.communicate()
-        logger.warning(f"Command timed out after {req.timeout}s: {req.command[:200]}")
+        duration_ms = int((time.monotonic() - started) * 1000)
+        logger.warning(
+            "execute timeout cmd_len=%d timeout=%ds duration_ms=%d cmd=%r",
+            len(req.command),
+            req.timeout,
+            duration_ms,
+            req.command[:200],
+        )
         return ExecuteResponse(
             stdout="",
             stderr=f"Command timed out after {req.timeout} seconds",
@@ -151,6 +165,14 @@ async def execute(req: ExecuteRequest):
     else:
         actual_stdout = stdout.rstrip("\n")
 
+    duration_ms = int((time.monotonic() - started) * 1000)
+    logger.info(
+        "execute cmd_len=%d exit_code=%d duration_ms=%d cwd=%s",
+        len(req.command),
+        exit_code,
+        duration_ms,
+        _cwd,
+    )
     return ExecuteResponse(
         stdout=actual_stdout,
         stderr=stderr.rstrip("\n"),

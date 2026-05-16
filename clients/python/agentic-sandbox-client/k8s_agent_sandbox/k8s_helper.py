@@ -167,6 +167,18 @@ class K8sHelper:
                     w.stop()
                     raise SandboxNotFoundError(f"Sandbox {name} was deleted before becoming ready.")
 
+    def patch_sandbox_claim_lifecycle(self, name: str, namespace: str, lifecycle: dict):
+        """Patch a SandboxClaim's spec.lifecycle (idle TTL renewal)."""
+        patch = {"spec": {"lifecycle": lifecycle}}
+        self.custom_objects_api.patch_namespaced_custom_object(
+            group=CLAIM_API_GROUP,
+            version=CLAIM_API_VERSION,
+            namespace=namespace,
+            plural=CLAIM_PLURAL_NAME,
+            name=name,
+            body=patch,
+        )
+
     def delete_sandbox_claim(self, name: str, namespace: str):
         """Deletes a SandboxClaim custom resource."""
         try:

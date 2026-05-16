@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.2.5] - 2026-05-16
+
+### Added
+- `OmniAgentSandboxClient` 新增 `shutdown_after_seconds` 参数:hard deadline 模式,sandbox 创建后 N 秒由 controller 自动 `Delete`,防止调用方异常退出忘了 `destroy` 导致 sandbox 长期占资源
+- `OmniAgentSandboxClient` 新增 `idle_timeout_seconds` 参数:E2B 风格 idle TTL,每次 `run` / `write` / `read` 调用都把 `SandboxClaim.spec.lifecycle.shutdownTime` 推到 `now+N`,活跃则续期;两参数同传时 idle 接管
+- `K8sHelper.patch_sandbox_claim_lifecycle(name, namespace, lifecycle)` 方法,封装 `CustomObjectsApi.patch_namespaced_custom_object` 用于 idle TTL 续期
+- `OmniAgentSandboxClient` 默认连接配置改为根据 `KUBERNETES_SERVICE_HOST` env 自动选择:集群内走 `SandboxInClusterConnectionConfig`(`svc.cluster.local` DNS 直连,绕开 kubectl port-forward 子进程),集群外保留 `SandboxLocalTunnelConnectionConfig`
+- `_ensure_sandbox` 为 `SandboxConnector` 注入按 sandbox_id 闭包绑定的 `get_pod_ip` callback,支持 `SandboxInClusterConnectionConfig(use_pod_ip=True)` 时绕开 DNS 走 pod IP
+- Sandbox runtime 新增 `/healthz` 和 `/readyz` 路由别名,对齐 K8s probe 惯用路径;`/` 保留向后兼容
+
+### Changed
+- `/execute` 端点每次结束输出结构化日志(`cmd_len` / `exit_code` / `duration_ms` / `cwd`),timeout 路径对齐相同字段;原先仅 timeout 路径 log,正常路径完全静默,排查链路问题无据可查
+
+## [0.2.4] - 2026-05-15
+
+### Changed
+- Sandbox runtime 容器身份模型重构对齐 E2B envd:server 以 root 起,`/execute` 通过 subprocess `user=AGENT_UID` 切到 agent 身份,`/upload` 落盘后 chown 文件与新建中间目录链给 agent;agent 身份与 server 身份解耦,改 `AGENT_UID` env 无需重建镜像
+- Dockerfile 新建标准 `user` (UID 1000,`HOME=/home/user`),移除 `USER 1000` 与 `NPM_CONFIG_PREFIX` hack;Lark CLI 改装到默认全局 prefix `/usr`,不再依赖 HOME 内 npm-global
+- 非 root 起 server 时退化为旧行为(subprocess 沿用当前身份、upload 不 chown),向后兼容
+
 ## [0.2.3] - 2026-04-21
 
 ### Added
