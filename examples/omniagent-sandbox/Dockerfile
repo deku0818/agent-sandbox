@@ -42,28 +42,33 @@ RUN uv pip install --system --no-cache -r /opt/.runtime/pyproject.toml \
     && chown -R 1000:1000 /opt/.runtime \
     && chmod 500 /opt/.runtime
 
-# Create agent user (UID 1000) and use /workspace as HOME. Since /workspace
-# is not mounted from outside, keeping everything the agent installs or
-# configures (npm global, pip --user, `lark login` tokens, shell history)
-# inside $HOME=/workspace makes the sandbox self-contained and mirrors a
-# real user's machine where dotfiles and working files coexist.
-RUN useradd -u 1000 -s /bin/bash -M -d /workspace agent \
-    && mkdir -p /workspace/.npm-global /workspace/.local/bin \
-    && chown -R agent:agent /workspace
+# Create `user` (UID 1000) — 跨 backend 统一身份（与 E2B envd 默认 user 对齐）。
+# HOME=/home/user 是标准 Linux 习惯；/workspace 只是工作目录，不再兼任 HOME。
+# Server runs as root (no USER directive) so the runtime can switch identity
+# per-request via setuid:
+# - /execute spawns subprocess with user=AGENT_UID
+# - /upload chown's the written file to AGENT_UID
+# Mirrors E2B envd—agent identity decoupled from server identity, change
+# AGENT_UID via Pod env without rebuilding image.
+RUN useradd -u 1000 -m -d /home/user -s /bin/bash user \
+    && mkdir -p /workspace \
+    && chown -R user:user /workspace /home/user
 
-ENV HOME=/workspace
-ENV NPM_CONFIG_PREFIX=/workspace/.npm-global
-ENV PATH=/workspace/.npm-global/bin:/workspace/.local/bin:$PATH
-ENV PYTHONPATH=/workspace
+# Operator identity that runtime hands to /execute subprocess and /upload
+# chown. 命名沿用 AGENT_UID/GID（OmniAgent 层"agent 操作身份"概念），Linux
+# 真实 user 名是 `user`——二者解耦，改 UID 无需 rebuild。
+ENV AGENT_UID=1000
+ENV AGENT_GID=1000
 
 WORKDIR /workspace
-USER 1000
 
-# Install Lark (Feishu) CLI as the agent user so it lands in ~/.npm-global
-# and exercises the same install path the agent uses at runtime.
+# Lark (Feishu) CLI 装到默认全局 prefix /usr，runtime PATH 自带 /usr/bin 兜
+# 住——不再需要 NPM_CONFIG_PREFIX hack 把它塞 HOME。
 RUN npm install -g @larksuite/cli \
     && npm cache clean --force
 
 EXPOSE 8888
 
+# Server runs as root—needed for setuid/chown per request. Subprocess + file
+# ownership get downgraded to AGENT_UID at request time (see main.py).
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8888", "--log-level", "info", "--app-dir", "/opt/.runtime"]

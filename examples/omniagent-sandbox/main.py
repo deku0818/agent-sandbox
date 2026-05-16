@@ -38,6 +38,16 @@ WORKSPACE_DIR = "/workspace"
 ALLOWED_DIRS = ("/workspace", "/tmp")
 CWD_SENTINEL = "___OMNIAGENT_CWD___"
 
+# Agent 操作身份：所有 /execute subprocess 和 /upload 落盘强制对齐到这个 uid。
+# 跟 E2B envd 行为对齐——server 可能以 root 起，但 LLM 看到的 ownership 始终
+# 等于 exec 身份，无需客户端做 chown 协调。
+AGENT_UID = int(os.environ.get("AGENT_UID", os.getuid()))
+AGENT_GID = int(os.environ.get("AGENT_GID", os.getgid()))
+# 只有 root server 才有切 uid 和 chown 任意 owner 的权限；非 root 起的话
+# subprocess 沿用当前身份、upload 不 chown（也就退化到 server 自己是 agent
+# 的当前默认行为，与改动前等效）。
+_CAN_SWITCH_IDENTITY = os.geteuid() == 0
+
 
 def get_safe_path(file_path: str) -> str:
     """Sanitizes the file path to ensure it stays within allowed directories.
@@ -91,13 +101,26 @@ async def execute(req: ExecuteRequest):
         f"{req.command}\n"
         f"__ec=$?; echo {CWD_SENTINEL}; pwd -P; exit $__ec"
     )
-    merged_env = {**os.environ, **req.env} if req.env else None
+    # subprocess `user=` 只改 uid，不会自动重置 HOME/USER/LOGNAME env，
+    # 默认会继承父进程（root 跑的 server）的 HOME=/root。显式改成 /home/user
+    # 让 dotfile / npm cache / shell history 落在 agent 自己的 HOME。
+    base_env = {**os.environ}
+    if _CAN_SWITCH_IDENTITY:
+        base_env["HOME"] = "/home/user"
+        base_env["USER"] = "user"
+        base_env["LOGNAME"] = "user"
+    merged_env = {**base_env, **req.env} if req.env else base_env
+    subprocess_kwargs: dict = {}
+    if _CAN_SWITCH_IDENTITY:
+        subprocess_kwargs["user"] = AGENT_UID
+        subprocess_kwargs["group"] = AGENT_GID
     proc = await asyncio.create_subprocess_shell(
         wrapped,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd="/workspace",
         env=merged_env,
+        **subprocess_kwargs,
     )
     try:
         stdout_bytes, stderr_bytes = await asyncio.wait_for(
@@ -142,9 +165,21 @@ async def upload(file: UploadFile = File(...)):
         full_path = get_safe_path(file.filename)
     except ValueError:
         return JSONResponse(status_code=403, content={"message": "Access denied"})
-    os.makedirs(os.path.dirname(full_path) or WORKSPACE_DIR, exist_ok=True)
+    parent = os.path.dirname(full_path) or WORKSPACE_DIR
+    os.makedirs(parent, exist_ok=True)
     with open(full_path, "wb") as f:
         f.write(await file.read())
+    # 把文件 + 新建出来的中间目录链都 chown 给 agent，避免 LLM(agent 身份)
+    # 因 root-owned 父目录的 sticky bit 拒 rm。与 E2B envd 落盘自动 user owned 对齐。
+    if _CAN_SWITCH_IDENTITY:
+        try:
+            os.chown(full_path, AGENT_UID, AGENT_GID)
+            d = parent
+            while d not in ALLOWED_DIRS and d != "/":
+                os.chown(d, AGENT_UID, AGENT_GID)
+                d = os.path.dirname(d)
+        except OSError as e:
+            logger.warning(f"chown failed for {full_path}: {e}")
     return JSONResponse({"message": f"uploaded {file.filename}"})
 
 
