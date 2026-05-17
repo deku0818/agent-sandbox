@@ -27,6 +27,7 @@ import time
 from kubernetes import client as k8s_client
 
 from .connector import SandboxConnector
+from .exceptions import SandboxNotFoundError
 from .k8s_helper import K8sHelper
 from .models import (
     ExecutionResult,
@@ -102,7 +103,6 @@ class OmniAgentSandboxClient:
         container's environ before launching the subprocess (user values win).
         """
         connector = self._ensure_sandbox(session_id)
-        self._renew(session_id)
         payload: dict[str, object] = {"command": command, "timeout": timeout}
         if env:
             payload["env"] = env
@@ -117,7 +117,6 @@ class OmniAgentSandboxClient:
     def write(self, session_id: str, path: str, content: bytes | str) -> None:
         """Upload a file to the sandbox."""
         connector = self._ensure_sandbox(session_id)
-        self._renew(session_id)
         if isinstance(content, str):
             content = content.encode("utf-8")
         connector.send_request("POST", "upload", files={"file": (path, content)})
@@ -125,24 +124,53 @@ class OmniAgentSandboxClient:
     def read(self, session_id: str, path: str) -> bytes:
         """Download a file from the sandbox."""
         connector = self._ensure_sandbox(session_id)
-        self._renew(session_id)
         response = connector.send_request("GET", f"download/{path}")
         return response.content
 
-    def _renew(self, session_id: str) -> None:
-        # idle TTL 模式下,每次活跃调用把 SandboxClaim.spec.lifecycle.shutdownTime
-        # 推到 now+idle_timeout_seconds,让 controller 顺延 Delete。失败不抛——若
-        # K8s 短暂不可达,下次调用会再续;若 sandbox 已被 controller 删,本次请求
-        # 也会收到 connection error,调用方按正常错误处理重建即可。
+    def _touch_or_invalidate(self, session_id: str) -> bool:
+        """续 TTL 并据此判断缓存的 connector 是否仍指向活的沙箱。
+
+        SandboxClaim 已被 controller GC 时,patch 返回 ``404``——这是权威失效
+        信号(比"撞请求 502 才知道"早一跳)。检测到 404 立即把缓存 connector
+        pop 掉,由 ``_ensure_sandbox`` 抛 ``SandboxNotFoundError`` 让调用方走
+        完整 destroy + rebuild,以便业务级 bootstrap 重做。
+
+        Returns:
+            True  - 沙箱仍健康(已续 TTL,或本就没启用 idle 模式)
+            False - 沙箱已 GC(缓存 connector 已清,调用方应处理失效)
+
+        其他 patch 失败(K8s API 短暂不可达等)按软失败处理:warn 后照常复用
+        connector——下次调用会再续,真坏了 send_request 也会暴露问题。
+        """
         if self.idle_timeout_seconds is None:
-            return
+            # 非 idle 模式没有续 TTL 的入口,失效检测兜底依赖请求路径的 connection error
+            return True
+
         lifecycle = construct_sandbox_claim_lifecycle_spec(self.idle_timeout_seconds)
         try:
             self.k8s_helper.patch_sandbox_claim_lifecycle(
                 session_id, self.namespace, lifecycle
             )
+            return True
+        except k8s_client.ApiException as e:
+            if e.status == 404:
+                logging.info(
+                    f"SandboxClaim {session_id} not found—evicting stale connector"
+                )
+                stale = self._connectors.pop(session_id, None)
+                if stale is not None:
+                    try:
+                        stale.close()
+                    except Exception as close_err:
+                        logging.debug(
+                            f"Closing stale connector for {session_id} failed: {close_err}"
+                        )
+                return False
+            logging.warning(f"Failed to renew TTL for {session_id}: {e}")
+            return True
         except Exception as e:
             logging.warning(f"Failed to renew TTL for {session_id}: {e}")
+            return True
 
     def destroy(self, session_id: str) -> None:
         """Destroy the sandbox for the given session."""
@@ -151,13 +179,35 @@ class OmniAgentSandboxClient:
         self.k8s_helper.delete_sandbox_claim(session_id, self.namespace)
 
     def _ensure_sandbox(self, session_id: str) -> SandboxConnector:
-        """Ensure sandbox exists and return its connector."""
+        """Ensure sandbox exists and return its connector.
+
+        三种情况:
+
+        1. 缓存命中 + 沙箱仍活: ``_touch_or_invalidate`` 续 TTL 成功 → 直接返
+           原 connector。整次调用最多一个 K8s patch(本来就要做来续 TTL,零额
+           外开销)。
+        2. 缓存命中 + 沙箱已被 controller GC: ``_touch_or_invalidate`` 检测
+           到 patch 404,已 pop 掉陈旧 connector,**抛 ``SandboxNotFoundError``**
+           让调用方走完整 destroy + rebuild。不在 SDK 内默默重建——SandboxClaim
+           被 GC 意味着 Pod 文件系统全丢,调用方往往有业务级 bootstrap(如
+           安装包、同步配置文件、注入环境变量)要重做;SDK 越权静默重建会
+           隐藏这件事,导致新 Pod 是"裸"状态。
+        3. 缓存里没有(首次调用): 保留 create-if-missing 便利路径——首次创
+           建沙箱由 SDK 自动完成。
+        """
         if session_id in self._connectors:
-            return self._connectors[session_id]
+            if self._touch_or_invalidate(session_id):
+                return self._connectors[session_id]
+            raise SandboxNotFoundError(
+                f"SandboxClaim {session_id} no longer exists "
+                f"(idle TTL GC or external delete); connector cache cleared. "
+                f"Call destroy(session_id) then retry to rebuild from scratch, "
+                f"or use a fresh session_id."
+            )
 
         # Create claim if it doesn't already exist。初始 lifecycle:idle 模式优先
-        # (避免创建后到第一次 _renew 之间出现空窗),否则用 hard deadline;两者都没
-        # 设就不带 lifecycle,沿用 SandboxClaim 默认行为。
+        # (避免创建后到第一次 _touch_or_invalidate 之间出现空窗),否则用 hard
+        # deadline;两者都没设就不带 lifecycle,沿用 SandboxClaim 默认行为。
         initial_ttl = self.idle_timeout_seconds or self.shutdown_after_seconds
         lifecycle = (
             construct_sandbox_claim_lifecycle_spec(initial_ttl)

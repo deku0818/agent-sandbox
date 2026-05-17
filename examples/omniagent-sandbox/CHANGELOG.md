@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.6] - 2026-05-17
+
+### Added
+- Dockerfile 预装 Aliyun CLI 二进制到 `/usr/local/bin`,并以 `user` 身份预装 `aliyun-cli-sls` 插件到 `~/.aliyun/plugins/`,供 `.omniagent/skills/device-logs` 在 sandbox 内调 `aliyun sls get-logs-v2` 查 SLS 日志,避免请求时再联网拉插件
+
+### Fixed
+- `OmniAgentSandboxClient` 缓存 connector 失效检测:idle TTL 续期 patch 收到 `404` 时(SandboxClaim 已被 controller GC),立即驱逐缓存的陈旧 connector 并抛 `SandboxNotFoundError`,而非沿用旧 connector 等下一次 `send_request` 撞 connection error;调用方据此走完整 `destroy + retry`,以便业务层 bootstrap(包安装、配置同步、env 注入)重做,避免新 Pod 处于"裸"状态。复用本就要做的 TTL patch 作为探测路径,零额外 K8s 调用
+
 ## [0.2.5] - 2026-05-16
 
 ### Added

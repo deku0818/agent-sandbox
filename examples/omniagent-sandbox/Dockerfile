@@ -36,6 +36,14 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
 # Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
+# Install Aliyun CLI (used by .omniagent/skills/device-logs to query SLS).
+# Binary goes to /usr/local/bin so every UID can call it.
+RUN curl -fsSL https://aliyuncli.alicdn.com/aliyun-cli-linux-latest-amd64.tgz \
+        -o /tmp/aliyun-cli.tgz \
+    && tar -xzf /tmp/aliyun-cli.tgz -C /usr/local/bin/ \
+    && rm /tmp/aliyun-cli.tgz \
+    && aliyun version
+
 # Copy API service to a hidden system directory
 COPY pyproject.toml main.py /opt/.runtime/
 RUN uv pip install --system --no-cache -r /opt/.runtime/pyproject.toml \
@@ -53,6 +61,13 @@ RUN uv pip install --system --no-cache -r /opt/.runtime/pyproject.toml \
 RUN useradd -u 1000 -m -d /home/user -s /bin/bash user \
     && mkdir -p /workspace \
     && chown -R user:user /workspace /home/user
+
+# Pre-install the Aliyun CLI SLS plugin into user's home so subprocess
+# spawned as AGENT_UID (1000) can use `aliyun sls get-logs-v2` etc. without
+# needing internet at request time. Plugin lives at ~/.aliyun/plugins/.
+USER user
+RUN aliyun plugin install --names aliyun-cli-sls
+USER root
 
 # Operator identity that runtime hands to /execute subprocess and /upload
 # chown. 命名沿用 AGENT_UID/GID（OmniAgent 层"agent 操作身份"概念），Linux
